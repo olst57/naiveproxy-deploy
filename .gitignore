@@ -1,0 +1,14 @@
+# 密钥与凭据
+.env*
+*.key
+*.state
+.naive-deploy-state
+
+# 运行产物
+*.log
+var/
+
+# validate-caddyfile.sh 会在脚本同目录找 caddy / caddy.exe；
+# 手动下载来校验配置的官方 caddy 不该进版本库（约 50 MB）。
+caddy
+caddy.exe

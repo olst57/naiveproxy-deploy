@@ -1,0 +1,41 @@
+# ⚠ 仅供人工参考的示例模板 —— 脚本运行时不读这个文件。
+# 它由 render_caddyfile() 在内存里生成后直接写入 /etc/caddy/Caddyfile，
+# 与这里的内容不共享代码路径。改这里不会改变脚本行为。
+#
+# 若想看脚本对你实际参数的渲染结果，用（只读，不改系统）：
+#   ./deploy-naive-caddy.sh --check --domain your.domain.com --email ops@mail.test
+
+{
+	order forward_proxy before file_server
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		# 不记录用户代理访问目标，避免日志侧信道泄露
+		exclude http.log.error
+	}
+}
+
+:443, your.domain.com {
+	tls ops@mail.test
+
+	encode
+
+	forward_proxy {
+		basic_auth 用户名 密码
+		# 下面这行只在你传了 --allow-ports "<列表>" 时才会被渲染出来。
+		# 留空则不限制客户端可访问的目标端口。
+		# ports 80 443
+		hide_ip
+		hide_via
+		probe_resistance
+	}
+
+	# 未认证访问者看到的就是这个正常站点（配合 probe_resistance 抗主动探测）
+	file_server {
+		root /var/www/naive-camouflage
+	}
+}

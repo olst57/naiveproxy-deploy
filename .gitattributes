@@ -1,0 +1,20 @@
+# 换行符策略 —— 必须显式钉死。
+#
+# 本项目的开发机是 Windows，且系统级 gitconfig 里 core.autocrlf=true
+# （C:/Program Files/Git/etc/gitconfig）。若不设这层，首次 `git add` 会把仓库里的
+# 纯 LF 文件全部转成 CRLF，直接导致两件事：
+#   1. shellcheck 报 SC1017（CR 会被当成命令的一部分）；
+#   2. 脚本在 Linux 上跑时报 `bad interpreter: /usr/bin/env bash^M`。
+# 所以：仓库内一律 LF，由这里的规则强制，不看开发机配置。
+
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+
+# 二进制/生成物不做换行符转换
+*.png binary
+*.jpg binary
+*.xz  binary
+*.gz  binary
+*.zip binary
+*.exe binary

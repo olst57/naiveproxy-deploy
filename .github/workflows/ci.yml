@@ -1,0 +1,83 @@
+# CI —— 本 workflow 只验证静态与离线行为，不构成「部署可用」的证据。
+#
+# 明确边界（不要误读为部署保证）：
+#   - 这里跑的是语法、shellcheck、离线自检、可执行位、换行符、版本一致性。
+#   - 它【不】在真 VPS 上跑部署，【不】验证连通性、【不】验证能否穿透受限网络。
+#   - 真机端到端验证是人工流程，证据见 docs/VERIFICATION.md。
+#
+# shellcheck 必须锁定 0.11.0：版本漂移会让结果不可复现（SC2329 等新规则随版本引入）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      SHELLCHECK_VERSION: 0.11.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 1. 语法检查 bash -n
+        run: |
+          for f in deploy-naive-caddy.sh validate-caddyfile.sh; do
+            bash -n "$f"
+            echo "OK  bash -n $f"
+          done
+
+      - name: 2. shellcheck（锁定 0.11.0，-x -S style）
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL -o /tmp/sc.tar.xz "$url"
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sc="/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$sc" --version | head -n 2
+          "$sc" -x -S style deploy-naive-caddy.sh validate-caddyfile.sh
+          echo "OK  shellcheck: 0 warnings"
+
+      - name: 3. 离线自检 --self-test（核心门禁）
+        run: |
+          ./deploy-naive-caddy.sh --self-test
+
+      - name: 4. 可执行位检查（Linux runner 会抓出 644 问题）
+        run: |
+          rc=0
+          for f in deploy-naive-caddy.sh validate-caddyfile.sh; do
+            if [ -x "$f" ]; then
+              echo "OK  可执行  $f"
+            else
+              echo "FAIL 缺少可执行位: $f （本地需 git update-index --chmod=+x）"
+              rc=1
+            fi
+          done
+          exit "$rc"
+
+      - name: 5. 换行符门禁（*.sh 必须全为 lf）
+        run: |
+          bad=$(git ls-files --eol '*.sh' | grep -v 'w/lf' || true)
+          if [ -n "$bad" ]; then
+            echo "FAIL 以下脚本不是 LF 换行（core.autocrlf 未受 .gitattributes 约束？）:"
+            echo "$bad"
+            exit 1
+          fi
+          git ls-files --eol '*.sh'
+          echo "OK  所有 *.sh 均为 LF"
+
+      - name: 6. 版本一致性（SCRIPT_VERSION 必须在 CHANGELOG 有对应标题）
+        run: |
+          ver=$(grep -oE '^SCRIPT_VERSION="[^"]+"' deploy-naive-caddy.sh | head -n1 | cut -d'"' -f2)
+          echo "SCRIPT_VERSION = $ver"
+          if grep -qE "^## \[${ver}\]" CHANGELOG.md; then
+            echo "OK  CHANGELOG.md 含 [${ver}]"
+          else
+            echo "FAIL CHANGELOG.md 找不到 [${ver}] 标题（版本号事实源 = 脚本 SCRIPT_VERSION）"
+            exit 1
+          fi
