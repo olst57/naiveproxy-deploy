@@ -1,0 +1,55 @@
+name: Bug 报告
+description: 部署失败、脚本报错、行为不符预期
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先跑一次诊断命令
+
+        它会把发行版、架构、服务状态、失败在哪一步都收集起来，**并且自动给密码打码** ——
+        输出可以直接贴进这个 issue。
+
+        ```bash
+        sudo ./deploy-naive-caddy.sh --collect-diagnostics
+        ```
+
+        > ⚠️ **不要手工贴真实密码、域名或服务器 IP。**
+        > 需要交流配置时用 `--collect-diagnostics` 的输出，它已经处理过敏感信息。
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断输出
+      description: 把 --collect-diagnostics 的完整输出粘在这里
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: stage
+    attributes:
+      label: 失败在第几阶段
+      description: 形如 "3/7 写入配置"；如果不确定就写"未进入部署"
+      placeholder: "3/7 写入配置"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望发生什么 / 实际发生了什么
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## 提醒
+
+        本脚本**只在真实 Linux VPS 上做过端到端验证**。开发机是 Windows，
+        所以很多问题需要一台真机才能复现 —— 如果确认需要真机，维护者会打上
+        `verification-needed` 标签，而不是让你反复补充信息。
+
+        另外请确认你读过了 README 的「安全说明」一节。

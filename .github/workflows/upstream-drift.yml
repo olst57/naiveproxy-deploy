@@ -1,0 +1,68 @@
+# 上游巡检 —— 每天打一次上游 API，确认脚本依赖的东西还在。
+#
+# 为什么需要它：脚本运行时依赖上游三件事——
+#   ① release 资产名恰好是 caddy-forwardproxy-naive.tar.xz
+#   ② release 里带 sha256 digest
+#   ③ 解压后能找到名为 caddy 的文件
+# 任何一条变了，所有用户会在同一天同时失败，而你会从 issue 里才得知。
+# 这个 job 把「用户先发现」变成「你先生道」。
+
+name: 上游巡检
+
+on:
+  schedule:
+    # 每天 03:17 UTC（避开整点高峰）
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查上游 release 是否仍符合脚本假设
+        run: |
+          set -euo pipefail
+          API='https://api.github.com/repos/klzgrad/forwardproxy/releases/latest'
+          json=$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' "$API")
+
+          tag=$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          echo "上游最新 tag: $tag"
+
+          # ① 资产名
+          if ! printf '%s' "$json" | grep -q 'caddy-forwardproxy-naive\.tar\.xz'; then
+            echo '::error::上游 release 里找不到资产 caddy-forwardproxy-naive.tar.xz —— 脚本会下载失败'
+            exit 1
+          fi
+          echo '✓ 资产名仍在'
+
+          # ② sha256 digest（脚本用它做完整性校验）
+          if ! printf '%s' "$json" | grep -qE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"'; then
+            echo '::error::上游 release 不再提供 sha256 digest —— 脚本的校验会退化成仅告警'
+            exit 1
+          fi
+          echo '✓ sha256 digest 仍在'
+
+      - name: 失败则开 issue（不重复开）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title='上游 release 结构变了，脚本可能失效'
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                     --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo '已有未关闭的同类 issue #'"$existing"'，只追加评论'
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body '巡检再次失败（$(date -u +%Y-%m-%d)）。上游结构仍未恢复。'
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --label bug \
+              --body '每日上游巡检失败。上游已经变了，脚本的下载/校验路径需要跟着改。详见 Actions 里「上游巡检」最近一次运行日志。'
+          fi
+
+      # 注意：本 workflow 只检查上游 API 结构，不构成「部署可用」的证据。

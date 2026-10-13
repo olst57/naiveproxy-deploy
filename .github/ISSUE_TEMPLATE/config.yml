@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 部署失败？先看常见问题
+    url: https://github.com/olst57/naiveproxy-deploy/blob/main/README.md
+    about: README 里有常见问题、参数说明与安全说明
