@@ -3417,10 +3417,14 @@ self_test() {
 		fi
 	}
 
-	has() { printf '%s' "$1" | grep -qE "$2"; }
+	# 用 <<< 而不是管道：大输入 + 匹配在开头时 grep 会提前退出，
+# 管道写法在 set -o pipefail 下会让「匹配成功」也返回 141（SIGPIPE）——
+# 表现为断言偶发假失败。herestring 没有上游进程，不存在这个问题。
+has() { grep -qE "$2" <<< "$1"; }
 	# has 的反面。单独定义是因为 false_case 看的是「退出码非 0」，
 	# 而管道 + pipefail 下 grep 无匹配本来就是非 0，语义正好对得上。
-	not_has() { printf '%s' "$1" | grep -qE "$2" && return 1; return 0; }
+	# 同 has()：管道写法在 pipefail 下会因 SIGPIPE 产生偶发假失败。
+not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 
 	skip_case() { printf '  %sSKIP%s %s\n' "$C_YEL" "$C_RST" "$1"; skip=$((skip + 1)); }
 
@@ -4309,16 +4313,6 @@ SSLCNF
 	# 裸写 ${st_def#${st_fn}} 时 st_fn 会被当 glob 模式匹配。当下值恰好是纯字面量
 	# 所以没出错，但一旦有特殊字符（* ? [）就会静默截错，包装器被定义成残体，
 	# 表现为「断言静默变成空断言」。用 fn_code 断，注释里写到的样子不算数。
-	# >>> 临时诊断（查 CI 平台差异）
-	{
-		echo 'DIAG-BEGIN'
-		echo "DIAG awk=$(awk --version 2>&1 | head -1)"
-		echo "DIAG fn_code_self_test_lines=$(fn_code self_test | wc -l)"
-		echo "DIAG fn_body_self_test_lines=$(fn_body self_test | wc -l)"
-		echo "DIAG has_quoted=$(fn_code self_test | grep -c 'st_def#' || true)"
-		echo "DIAG src_line=$(grep -n 'st_def#' "$0" | head -1)"
-		echo 'DIAG-END'
-	} >&2
 	true_case "去前缀展开式的变量带引号（SC2295）" \
 		has "$(fn_code self_test)" '\$\{st_def#"\$\{st_fn\}"\}'
 	true_case "不再出现未加引号的去前缀展开式" \
