@@ -23,9 +23,53 @@
 #
 # 退出码: 0 成功 / 主动取消 | 1 校验或部署失败
 #
+# ================ 区域索引（按文件顺序；行号会漂所以不写行号）================
+# 下面每条顶格（列首）的 `# ---------------- 标题 ----------------` 就是一个区段。
+# 按顺序列标题、不列行号：行号一改文件就漂，标题才是稳的锚。
+# 改标题了就顺手改这里，别让索引漂掉。
+# （函数体内缩进的同类注释不属于区段，故不在此列。）
+# ST_INDEX_BEGIN
+#     ～ acme.sh 证书路径的落点（真机已验证的布局）
+#     ～ 运行期状态（全部显式初始化：set -u 下未定义会直接报错）
+#     ～ 证书模式（三层降级，见 --cert-mode）
+#     ～ 阶段表（编号与名字的唯一来源）
+#     ～ 颜色与字形
+#     ～ 输出
+#     ～ 失败处理
+#     ～ 状态文件读写
+#     ～ 帮助与引导
+#     ～ 输入校验
+#     ～ acme.sh 的续期钩子（reload 脚本 + systemd timer）
+#     ～ 配置渲染
+#     ～ 环境探测
+#     ～ 端口探测
+#     ～ 确认
+#     ～ 预检项
+#     ～ 阶段 1: 系统依赖
+#     ～ 阶段 2: caddy 二进制
+#     ～ 阶段 3: 用户与目录
+#     ～ 阶段 4: 配置
+#     ～ 阶段 5: 伪装站点
+#     ～ 阶段 5: 伪装站点
+#     ～ 阶段 6: 服务
+#     ～ 阶段 7: 验证
+#     ～ 汇总
+#     ～ 卸载
+#     ～ 换密码
+#     ～ 求助诊断
+#     ～ 体检（只读）
+#     ～ 重载 / 升级
+#     ～ 参数校验
+#     ～ 参数解析
+#     ～ 主流程
+#     ～ 自检用的顶层辅助
+#     ～ 开发者自检
+#     ～ 子集过滤（--self-test <模式>）
+# ST_INDEX_END
+#
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 CADDY_FALLBACK_TAG="v2.11.7-naive"
 GH_REPO="klzgrad/forwardproxy"
 CADDY_BIN="/usr/bin/caddy"
@@ -44,6 +88,21 @@ SVC_FILE="/etc/systemd/system/caddy.service"
 OPENRC_FILE="/etc/init.d/caddy"
 TMP_DIR=""
 
+# ---------------- acme.sh 证书路径的落点（真机已验证的布局） ----------------
+# 统一到一个目录，而不是直接把 caddy 指到 ~/.acme.sh 里去：
+#   ~/.acme.sh 是 0700 root，caddy 以非特权用户运行，读不到。
+# 这里的 750 root:caddy + 文件 644/640 正是为了「caddy 用户能读、别人不能读私钥」。
+CERT_DIR="/etc/ssl/naiveproxy"
+CERT_FILE="${CERT_DIR}/fullchain.pem"
+CERT_KEY_FILE="${CERT_DIR}/privkey.pem"
+CERT_CHAIN_FILE="${CERT_DIR}/chain.pem"
+# acme.sh 的安装位置（官方默认 ~/.acme.sh）与续期钩子
+ACME_HOME="${HOME}/.acme.sh"
+ACME_BIN="${ACME_HOME}/acme.sh"
+ACME_RELOAD_SH="/usr/local/bin/naive-cert-reload.sh"
+ACME_TIMER="/etc/systemd/system/acme-sh-renew.timer"
+ACME_SERVICE="/etc/systemd/system/acme-sh-renew.service"
+
 # ---------------- 运行期状态（全部显式初始化：set -u 下未定义会直接报错） ----------------
 DOMAIN=""
 EMAIL=""
@@ -59,6 +118,8 @@ BUILD_FROM_SRC="no"
 SKIP_VERIFY="no"
 ASSUME_YES="no"
 SELF_TEST="no"
+# --self-test 的可选过滤模式：非空时只跑匹配的断言（见 self_test 内的子集过滤）。
+SELF_TEST_PATTERN=""
 RELOAD_ONLY="no"
 CHECK_ONLY="no"
 ROTATE_PASSWORD="no"
@@ -67,6 +128,21 @@ ASCII_ONLY="no"
 PROBE_SECRET=""
 PAC_PATH=""
 CLIENT_PROTO="https"
+
+# ---------------- 证书模式（三层降级，见 --cert-mode） ----------------
+# CERT_MODE 是「用户要求」，CERT_MODE_ACTUAL 是「实际选中」。分开是因为 auto
+# 要探测机器有没有 acme.sh 才能定，而探测结果必须能被 --check 只读地预演。
+CERT_MODE="auto"
+CERT_MODE_ACTUAL=""
+# Cloudflare 凭据只从文件或环境变量读，绝不从命令行传（会进 shell 历史）
+CF_TOKEN_FILE=""
+CF_TOKEN=""
+ACME_EMAIL=""       # 未显式给就沿用 --email
+ACME_STAGING="no"   # --acme-staging：用 letsencrypt_test，不消耗生产额度
+RENEW_METHOD=""     # systemd | cron | none —— 续期到底靠什么在跑
+# 我们到底知不知道现有配置用的是哪种证书模式。保留旧配置、又读不到状态文件时
+# 只能回答「不知道」—— 这时候绝不猜，猜错会把用户引到错误方向。
+CERT_MODE_KNOWN="yes"
 
 # 环境探测结果
 OS_ID=""
@@ -188,6 +264,7 @@ STATE_PAC_PATH=$(state_read_one PAC_PATH)
 STATE_CLIENT_PROTO=$(state_read_one CLIENT_PROTO)
 STATE_TLS_CERT=$(state_read_one TLS_CERT)
 STATE_TLS_KEY=$(state_read_one TLS_KEY)
+STATE_CERT_MODE=$(state_read_one CERT_MODE)
 	return 0
 }
 
@@ -209,6 +286,9 @@ state_revalidate() {
 	if [ -n "${STATE_TLS_CERT:-}" ]; then validate_path_value "$STATE_TLS_CERT" || bad=1; fi
 	if [ -n "${STATE_TLS_KEY:-}" ]; then validate_path_value "$STATE_TLS_KEY" || bad=1; fi
 	if [ -n "${STATE_CLIENT_PROTO:-}" ]; then validate_client_proto "$STATE_CLIENT_PROTO" || bad=1; fi
+	# 证书模式同样会被读回来参与决策，必须一起过校验器。
+	# 一个被改坏的 STATE_CERT_MODE 会让重跑时选错证书路径。
+	if [ -n "${STATE_CERT_MODE:-}" ]; then validate_cert_mode "$STATE_CERT_MODE" || bad=1; fi
 	return "$bad"
 }
 
@@ -241,6 +321,7 @@ state_write() {
 		printf 'STATE_CLIENT_PROTO=%s\n' "${CLIENT_PROTO}"
 		printf 'STATE_TLS_CERT=%s\n' "${TLS_CERT_FILE}"
 		printf 'STATE_TLS_KEY=%s\n' "${TLS_KEY_FILE}"
+		printf 'STATE_CERT_MODE=%s\n' "${CERT_MODE_ACTUAL}"
 	} > "${tmp}" || return 1
 	chmod 0600 "${tmp}" 2>/dev/null || true
 	mv -f "${tmp}" "${STATE_FILE}" || { rm -f "${tmp}"; return 1; }
@@ -355,7 +436,7 @@ run_stage() { # <序号> <函数...>
 # ---------------- 帮助与引导 ----------------
 usage() {
 	cat <<'USAGE'
-NaiveProxy 服务端部署脚本 v2.4.0
+NaiveProxy 服务端部署脚本 v2.5.0
 把这台服务器变成一台 NaiveProxy 服务端（Caddy + 伪装站点）。
 
 第一次用？按这个顺序走：
@@ -401,6 +482,29 @@ NaiveProxy 服务端部署脚本 v2.4.0
                          为什么要这个选项：Let's Encrypt 对同一个域名每 7 天只发 5 张
                          证书。反复重装（尤其用 --purge 删掉证书数据后）会把额度用尽，
                          之后要等整整一周才能再签。已有证书就直接复用，零额度消耗。
+  --cert-mode <方式>      证书怎么来，四选一（默认 auto）：
+                           auto   自动判断：给了 --tls-cert 就用文件；否则机器上有
+                                  acme.sh 就用它；再否则交给 Caddy 自己申请
+                           acme   强制用 acme.sh 申请（需要 Cloudflare token）
+                           caddy  强制交给 Caddy 自己向 Let's Encrypt 申请
+                           file   强制使用 --tls-cert/--tls-key 指定的文件
+
+证书续期（acme.sh 方式）：
+  --cf-token-file <文件>  Cloudflare API token 的文件路径，用于 acme.sh 的 DNS-01 校验。
+                         文件里只放 token 一行，不要带 export 或引号。
+                         为什么不支持 --cf-token 直接传值：命令行参数会进 shell 历史，
+                         也可能出现在 ps 输出里。另一个办法是用环境变量：
+                           sudo CF_Token='你的token' -E ./deploy-naive-caddy.sh ...
+                         为什么要 Cloudflare token：DNS-01 走 Cloudflare API 加一条
+                         临时 TXT 记录来证明域名归你，不需要 80 端口对外可达。
+                         token 需要有 Zone → DNS → Edit 权限。
+  --acme-email <邮箱>     acme.sh 的证书通知邮箱，默认沿用 --email
+  --acme-staging          用 Let's Encrypt 的测试环境（letsencrypt_test）。
+                         调试时不消耗生产额度 —— 正式用别加这个。
+
+注意：acme.sh 是 GPL-3.0 许可，本脚本是 MIT。我们只「调用」它的命令行，
+不把它的源码打包进本仓库 —— 这是许可边界，也是它能被安全使用的前提。
+安装器从官方地址 https://get.acme.sh 现场获取。
   --client-proto <协议>    客户端 config.json 用 https|quic（默认 https）。
                          quic 在丢包 / 移动网络下常有更好表现。
   --allow-ports "<列表>"  限定客户端可经代理访问的目标端口，如 "80 443"。
@@ -420,7 +524,15 @@ NaiveProxy 服务端部署脚本 v2.4.0
   --rotate-password      换一个代理密码，改配置 + 平滑重载
   --collect-diagnostics  收集排查信息（密码自动打码），求助时把输出发出来
   --uninstall            卸载服务（加 --purge 连站点/日志/数据/用户一起删）
-  --self-test            开发者自检，不需要 root
+  --self-test [关键词]   开发者自检，不需要 root。跑满全部要一两分钟；
+                         加上关键词就只跑相关的几条，通常几秒出结果。
+                         关键词匹配什么（不区分大小写）：
+                            · 断言的文字说明，如 state_、tls-cert、密码
+                            · 或它所在小节的标题，如 状态、证书、密码生成
+                         例：--self-test state_    名字或小节含 state_ 的
+                             --self-test 状态     同上，用中文小节名挑
+                         不带关键词 = 跑全量（与以前完全一致）。
+                         一个都没匹配上会明确报错并非零退出，不会假装通过。
   -V, --version          显示版本
   -h, --help             显示本帮助
 USAGE
@@ -625,6 +737,440 @@ gen_password() {
 }
 # 预览时密码位置的占位符（--check / --dry-run 用，绝不显示真实密码）
 PASS_PREVIEW="<部署时自动生成>"
+
+# ================ 证书模式：自动选择 / acme.sh 安装 / 续期 ================
+# 三层降级（--cert-mode auto）：
+#   ① 显式给了 --tls-cert/--tls-key  → 用现成文件（零额度消耗，行为与旧版一致）
+#   ② 机器上有 acme.sh               → 用 acme.sh 申请 + 装 systemd timer 续期
+#   ③ 都没有                         → 交给 caddy 自己向 ACME 申请（给邮箱时）
+#
+# 许可证边界（必须守住）：acme.sh 是 GPL-3.0，本仓库是 MIT。
+# 我们只「调用它的 CLI」，绝不把它的源码 vendor/复制进本仓库 ——
+# 调用是边界使用、不是衍生作品；一旦把代码搬进来，整个仓库就得跟着变 GPL-3.0。
+
+# --cert-mode 的取值校验
+validate_cert_mode() {
+	case "${1:-}" in
+		auto|acme|caddy|file) return 0 ;;
+	esac
+	return 1
+}
+
+# 机器上有没有可用的 acme.sh。两个位置都认：
+#   · PATH 里的 acme.sh（发行版包管理器装的）
+#   · ~/.acme.sh/acme.sh（官方安装器装的默认位置）
+# 只探测、不改动 —— --check 也要用它做只读预演。
+detect_acme_sh() {
+	if command -v acme.sh >/dev/null 2>&1; then
+		printf '%s' "$(command -v acme.sh)"
+		return 0
+	fi
+	if [ -x "${ACME_BIN}" ]; then
+		printf '%s' "${ACME_BIN}"
+		return 0
+	fi
+	return 1
+}
+
+# 是否显式指定了证书文件（模式 ①）。判据只认这两个变量，
+# 不从 CERT_MODE 反推 —— auto 模式下它们是空的，语义才一致。
+cert_files_given() {
+	[ -n "${TLS_CERT_FILE}" ] || [ -n "${TLS_KEY_FILE}" ]
+}
+
+# 自动模式下的三层降级决策。这是 --cert-mode auto 的全部逻辑所在，
+# 单独成函数是为了让 --check 与正式部署调用同一份判断（避免两条路径漂移）。
+# 输出：file | acme | caddy —— 不写任何全局变量，便于被 --check 只读调用。
+resolve_cert_mode() {
+	# ① 显式文件最优先：用户既然给了，就照他的来
+	if cert_files_given; then
+		printf 'file'
+		return 0
+	fi
+	# ② 机器上有 acme.sh 就优先用它 —— 前提是能拿到 Cloudflare 凭据来跑 DNS-01，
+	#    否则退回到 caddy。为什么要有这个前提：acme.sh 侧我们只实现了 dns_cf；
+	#    没有凭据就硬走 acme.sh 会卡在申请环节，不如交给 caddy 的 HTTP-01。
+	if [ -n "${CF_TOKEN}" ] && detect_acme_sh >/dev/null 2>&1; then
+		printf 'acme'
+		return 0
+	fi
+	# ③ 兜底：交给 caddy 自己申请（有邮箱时），都没有就是 tls internal
+	printf 'caddy'
+}
+
+# 最终拍板：把用户要求（CERT_MODE）和自动判断合到一起，写进 CERT_MODE_ACTUAL。
+# 显式 --cert-mode 时它是硬覆盖：用户说要 file 就必须 file（缺文件由校验器拦）。
+decide_cert_mode() {
+	case "${CERT_MODE}" in
+		file|acme|caddy) CERT_MODE_ACTUAL="${CERT_MODE}" ;;
+		*) CERT_MODE_ACTUAL="$(resolve_cert_mode)" ;;
+	esac
+	# acme 模式必须有 Cloudflare 凭据，否则申请必失败。这里直接报人话，
+	# 别让用户等到阶段 6 才看到一句 ACME 错误。
+	if [ "${CERT_MODE_ACTUAL}" = "acme" ] && [ -z "${CF_TOKEN}" ]; then
+		err "选了 acme.sh 管证书（--cert-mode acme），但没给 Cloudflare 凭据。"
+		err "  DNS-01 校验需要它。两种给法（都不会进 shell 历史）："
+		err "    ① 文件：--cf-token-file /root/.cf-token   （内容只放 token 一行）"
+		err "    ② 环境变量：sudo CF_Token='...' -E $0 --cert-mode acme ..."
+		err "  Cloudflare 后台 → My Profile → API Tokens → 建一个带 Zone:DNS:Edit 权限的 token。"
+		return 1
+	fi
+	return 0
+}
+
+# Cloudflare token 的来源集中处理。刻意只支持「文件」和「环境变量」两条路，
+# 绝不做 --cf-token <值>：命令行参数会原样落进 ~/.bash_history 和 ps 输出。
+load_cf_token() {
+	# 环境变量优先（用户可能已经 export 了）
+	if [ -n "${CF_Token:-}" ]; then
+		CF_TOKEN="${CF_Token}"
+		return 0
+	fi
+	[ -n "${CF_TOKEN_FILE}" ] || return 0
+	if [ ! -f "${CF_TOKEN_FILE}" ]; then
+		err "指定的 token 文件不存在: ${CF_TOKEN_FILE}"
+		return 1
+	fi
+	# 只取第一行、去掉首尾空白与可能的引号；token 里不会有空格。
+	CF_TOKEN="$(head -1 "${CF_TOKEN_FILE}" 2>/dev/null | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+	CF_TOKEN="${CF_TOKEN%\"}"; CF_TOKEN="${CF_TOKEN#\"}"
+	if [ -z "${CF_TOKEN}" ]; then
+		err "token 文件 ${CF_TOKEN_FILE} 是空的（里面应该只有一行 token）"
+		return 1
+	fi
+	# token 会被 export 给 acme.sh。做个字符集校验，免得文件里混进奇怪内容
+	# 被当成命令的一部分 —— 这是从「用户可控文件」到「子进程环境」的边界。
+	printf '%s' "${CF_TOKEN}" | grep -qE '^[A-Za-z0-9_-]+$' || {
+		err "token 文件里的内容不像一个 Cloudflare API token（只允许字母数字、下划线、连字符）"
+		err "  常见原因：文件里还留了 'export CF_Token=' 前缀，或者有多余的引号。"
+		err "  正确做法：文件里只放 token 本身，一行，不带任何前后缀。"
+		return 1
+	}
+	return 0
+}
+
+# 官方安装器的一行式命令。无 cron 的机器必须加 --force，否则安装器会
+# 拒绝安装（真机实测：Debian 13 无 crontab，官方安装器直接报错退出）。
+# 这里把「有没有 cron」探出来，决定要不要 --force，而不是无脑带上 ——
+# 无脑 --force 会掩盖安装器将来对别的环境不满足条件的告警。
+install_acme_sh() {
+	# TMP_DIR 正常由阶段 2 建好，但别依赖调用顺序 —— 没建就自己建一个，
+	# 否则 installer 会变成 "/get-acme.sh" 写进根目录。
+	if [ -z "${TMP_DIR}" ] || [ ! -d "${TMP_DIR}" ]; then
+		TMP_DIR=$(mktemp -d) || { err "创建临时目录失败"; return 1; }
+	fi
+	local installer="${TMP_DIR}/get-acme.sh" force="" email="${ACME_EMAIL:-${EMAIL}}"
+	if ! need_cmd curl; then
+		err "装 acme.sh 需要 curl，但本机没有"
+		return 1
+	fi
+	if ! need_cmd crontab && ! need_cmd fcrontab; then
+		force="--force"
+		note "本机没有 cron —— acme.sh 安装器需要 --force 才肯装（续期改用 systemd timer）"
+	fi
+	note "从官方地址获取 acme.sh 安装器：https://get.acme.sh"
+	if ! curl -fsSL --max-time 30 "https://get.acme.sh" -o "${installer}" >>"${DEPLOY_LOG}" 2>&1; then
+		err "下载 acme.sh 安装器失败（网络问题？）"
+		show_log_tail 10
+		return 1
+	fi
+	# 只看它是不是个可执行的 shell 脚本，不 vendor 它的内容。
+	if ! head -1 "${installer}" 2>/dev/null | grep -q '^#!.*sh'; then
+		err "下载到的安装器看起来不是 shell 脚本，已中止（可能被劫持）"
+		return 1
+	fi
+	# 官方用法就是 curl | sh。这里先下载到临时文件再执行，便于先做一次检查。
+	# 重定向掉 acme.sh 自己的安装日志，装完再回读关键几行。
+	note "安装 acme.sh（日志写入 ${DEPLOY_LOG}）…"
+	if ! sh "${installer}" "email=${email}" ${force} >>"${DEPLOY_LOG}" 2>&1; then
+		err "acme.sh 安装失败"
+		show_log_tail 15
+		err "  手动安装办法：curl https://get.acme.sh | sh -s email=${email} --force"
+		return 1
+	fi
+	if ! detect_acme_sh >/dev/null 2>&1; then
+		err "安装器跑完了，但仍找不到 acme.sh（既不在 PATH，也不在 ${ACME_BIN}）"
+		return 1
+	fi
+	ok "acme.sh 已安装"
+	return 0
+}
+
+# 不管 acme.sh 是新装的还是机器上本来就有的，都要把默认 CA 切成 Let's Encrypt。
+# 为什么必须显式切：acme.sh 的 DEFAULT_CA 默认指向 ZeroSSL（源码 DEFAULT_CA=$CA_ZEROSSL），
+# 不切的话证书会静默地由 ZeroSSL 签发 —— 用户以为拿到的是 Let's Encrypt。
+# 这一步是幂等的：已是 LE 时再设一次无副作用。
+set_acme_default_ca() {
+	local bin=""
+	bin=$(detect_acme_sh) || return 1
+	if "${bin}" --set-default-ca --server letsencrypt >>"${DEPLOY_LOG}" 2>&1; then
+		ok "acme.sh 默认 CA 已设为 Let's Encrypt"
+		return 0
+	fi
+	warn "设置 acme.sh 默认 CA 失败（不影响申请时用 --server 显式指定）"
+	return 0
+}
+
+# acme.sh 装完（或检测到已装）后的统一收尾：切 CA、把 token 交给它持久化。
+# token 交给 acme.sh 的方式是「写进它自己的 account.conf」——
+# dns_cf 插件会 _saveaccountconf_mutable CF_Token，续期时从那里读，
+# 所以 timer 触发的续期不需要我们再注入环境变量。
+prepare_acme_sh() {
+	[ -n "${CF_TOKEN}" ] || return 0
+	local bin=""
+	bin=$(detect_acme_sh) || return 1
+	# 让 dns_cf 插件把 token 落到 account.conf。--register-account 只是最轻的
+	# 一次调用，会顺带触发凭据持久化；失败也不致命（申请那一步还会再存一次）。
+	CF_Token="${CF_TOKEN}" "${bin}" --register-account \
+		--accountemail "${ACME_EMAIL:-${EMAIL}}" >>"${DEPLOY_LOG}" 2>&1 || true
+	return 0
+}
+
+# acme 模式的「开工准备」：装 acme.sh（缺则装）、切默认 CA、落地 reload 脚本。
+# 全是幂等操作，重跑安全。刻意不在这里申请证书 —— 申请是有额度消耗的外部动作，
+# 只在真的要重写配置时（write_config 的渲染分支）才做。
+acme_prepare() {
+	if ! detect_acme_sh >/dev/null 2>&1; then
+		note "机器上没有 acme.sh，开始安装（用户要求：没有就要装上）"
+		install_acme_sh || return 1
+	else
+		note "机器上已有 acme.sh: $(detect_acme_sh)"
+	fi
+	# 装完立刻切 CA —— 否则默认会静默用 ZeroSSL（源码 DEFAULT_CA=$CA_ZEROSSL）
+	set_acme_default_ca
+	# token 交给 acme.sh 自己持久化到 account.conf
+	prepare_acme_sh
+	# reload 脚本必须先落地：issue 时的 --reloadcmd 会立刻执行它
+	render_acme_reload_script > "${ACME_RELOAD_SH}" || { err "写入 ${ACME_RELOAD_SH} 失败"; return 1; }
+	chmod 0755 "${ACME_RELOAD_SH}" || { err "设置 ${ACME_RELOAD_SH} 权限失败"; return 1; }
+	ok "证书续期钩子已就绪: ${ACME_RELOAD_SH}"
+	return 0
+}
+
+# ---------------- acme.sh 的续期钩子（reload 脚本 + systemd timer） ----------------
+# 这个脚本的职责只有一件事：修权限 + 让 caddy 真的读到新证书。
+# 为什么 reload 不能用 `systemctl reload caddy`（事实 1，真机实测）：
+#   它返回 0，但 TLS 握手读到的仍是旧证书 —— 静默失效，到期那天才发现。
+#   必须用 `caddy reload --force --config ...`，它才会真正换成新证书。
+# 也绝不要写成 `systemctl reload caddy || caddy reload --force`：
+#   前者退出码是 0，|| 右边的兜底永远不会执行，续期就静默失效了。
+render_acme_reload_script() {
+	cat <<EOF
+#!/usr/bin/env bash
+#
+# naive-cert-reload.sh —— acme.sh 续期后，让 caddy 真正用上新证书
+#
+# 由 deploy-naive-caddy.sh 生成，可被覆盖重装。手工改这里的内容会在下次部署时丢失。
+#
+# 为什么需要这个脚本，而不是在 acme.sh 的 --reloadcmd 里直接写一行 reload：
+#   ① 证书是我们用 --install-cert 落到 ${CERT_DIR}/ 的，属主/权限得收拾干净，
+#      否则 caddy 用户读不到、服务起不来（而且是在半夜续期时才炸）。
+#   ② \`systemctl reload caddy\` 在真机上返回成功但握手仍是旧证书（静默失效）。
+#      必须 \`caddy reload --force\`。这里把它固化成代码，避免以后有人改回去。
+#
+set -Eeuo pipefail
+
+CERT_DIR="${CERT_DIR}"
+CERT_FILE="${CERT_FILE}"
+KEY_FILE="${CERT_KEY_FILE}"
+CADDY_BIN="${CADDY_BIN}"
+CONF_FILE="${CONF_FILE}"
+
+log() { printf '[naive-cert-reload] %s\n' "\$*"; }
+die() { printf '[naive-cert-reload] 错误: %s\n' "\$*" >&2; exit 1; }
+
+[ -d "\${CERT_DIR}" ] || die "证书目录不存在: \${CERT_DIR}"
+[ -s "\${CERT_FILE}" ] || die "证书文件为空: \${CERT_FILE}"
+[ -s "\${KEY_FILE}" ] || die "私钥文件为空: \${KEY_FILE}"
+
+# 属主收敛为 root:caddy。私钥 640（只有 caddy 组能读），全链 644。
+log "修正证书权限…"
+chown root:caddy "\${CERT_FILE}" "\${KEY_FILE}" 2>/dev/null || true
+[ -f "\${CERT_DIR}/chain.pem" ] && chown root:caddy "\${CERT_DIR}/chain.pem" 2>/dev/null || true
+chmod 0750 "\${CERT_DIR}" 2>/dev/null || true
+chmod 0644 "\${CERT_FILE}" 2>/dev/null || true
+[ -f "\${CERT_DIR}/chain.pem" ] && chmod 0644 "\${CERT_DIR}/chain.pem" 2>/dev/null || true
+chmod 0640 "\${KEY_FILE}" 2>/dev/null || true
+
+# 判据是「caddy 用户能不能真读到」，不是权限位看着对不对
+if id caddy >/dev/null 2>&1; then
+	if ! runuser -u caddy -- test -r "\${CERT_FILE}" 2>/dev/null ||
+	   ! runuser -u caddy -- test -r "\${KEY_FILE}" 2>/dev/null; then
+		die "caddy 用户仍读不到证书 —— 服务会起不来。请检查 \${CERT_DIR} 的属主与权限。"
+	fi
+fi
+
+[ -x "\${CADDY_BIN}" ] || die "找不到 caddy: \${CADDY_BIN}"
+
+# 首次安装时，acme.sh 的 --install-cert 会立刻调这个脚本一次 —— 而那一刻
+# Caddyfile 还没写、服务还没装。没有东西可重载，直接成功退出即可
+# （权限已经修好，后面阶段启动 caddy 时会读到新证书）。
+# 如果这里反过来报错退出，acme.sh 的 installcert 会判定失败，整个阶段 4 挂掉。
+if [ ! -f "\${CONF_FILE}" ]; then
+	log "配置 \${CONF_FILE} 还不存在（首次安装的中间步骤）—— 证书已就位，跳过 reload"
+	exit 0
+fi
+
+# 主路径：caddy reload --force。它会真正替换进程里的证书。
+# 兜底才用 restart —— restart 会断开现有连接，非必要不用。
+if "\${CADDY_BIN}" reload --force --config "\${CONF_FILE}" 2>/dev/null; then
+	log "caddy reload --force 成功"
+	exit 0
+fi
+
+# 服务本来就没在跑时，reload 失败是正常的（没有进程可重载）——
+# 证书已就位，等它启动时自然会读到新的，不必判失败。
+if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet caddy 2>/dev/null; then
+	log "caddy 服务未运行 —— 证书已就位，跳过 reload（下次启动会读到新证书）"
+	exit 0
+fi
+
+log "caddy reload 失败，改用 systemctl restart 兜底"
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl restart caddy || die "systemctl restart caddy 也失败了"
+elif command -v rc-service >/dev/null 2>&1; then
+	rc-service caddy restart || die "rc-service caddy restart 也失败了"
+else
+	die "没有可用的服务管理器来重启 caddy"
+fi
+log "重启完成"
+EOF
+}
+
+# systemd timer：每天跑一次 acme.sh 的 --cron。
+# 为什么不用 cron：真机实测这台机器没有 cron（crontab 缺失、cron inactive）。
+# timer 里带 RandomizedDelaySec，避免所有机器在同一秒打 ACME 服务器。
+render_acme_renew_service() {
+	cat <<EOF
+[Unit]
+Description=acme.sh 证书续期（naiveproxy）
+Documentation=https://github.com/acmesh-official/acme.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 用 acme.sh 自己的 --cron 走一遍所有证书；没到期它会自己跳过。
+# 环境里显式带上 HOME，否则 acme.sh 找不到 ~/.acme.sh。
+Environment=HOME=${HOME}
+ExecStart=${ACME_BIN} --cron --home ${ACME_HOME}
+EOF
+}
+
+render_acme_renew_timer() {
+	cat <<'EOF'
+[Unit]
+Description=每天触发一次 acme.sh 证书续期
+
+[Timer]
+# 每天一次即可 —— acme.sh 自己按 ARI 算出真正的续期窗口，没到期会跳过。
+OnCalendar=daily
+# 打散到 1 小时内，避免整点惊群
+RandomizedDelaySec=3600
+# 机器关机期间错过的那次，开机后补跑
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# 安装续期机制。systemd 环境用 timer；OpenRC 环境没有 systemd，
+# 必须退回到「cron 或 acme.sh 自带 --cron 配合 crond」，并且在没有可靠
+# 定时机制时明确警告 —— 静默没有续期，等于证书到期那天整个服务挂掉。
+install_renewal() {
+	if [ "${INIT}" = "systemd" ]; then
+		render_acme_reload_script > "${ACME_RELOAD_SH}" || { err "写入 ${ACME_RELOAD_SH} 失败"; return 1; }
+		chmod 0755 "${ACME_RELOAD_SH}"
+		render_acme_renew_service > "${ACME_SERVICE}" || { err "写入 ${ACME_SERVICE} 失败"; return 1; }
+		render_acme_renew_timer > "${ACME_TIMER}" || { err "写入 ${ACME_TIMER} 失败"; return 1; }
+		systemctl daemon-reload >/dev/null 2>&1 || true
+		systemctl enable --now acme-sh-renew.timer >/dev/null 2>&1 || {
+			# 不因为 enable 失败就把整个部署判死 —— 证书本身已经装好了，
+			# 但必须把「续期没起来」这件事明确告诉用户。
+			warn "启用 acme-sh-renew.timer 失败 —— 证书不会自动续期"
+			warn "  手动启用：sudo systemctl enable --now acme-sh-renew.timer"
+			RENEW_METHOD="none"
+			return 0
+		}
+		ok "续期定时器已启用（systemd timer，每天跑一次）"
+		RENEW_METHOD="systemd"
+		return 0
+	fi
+
+	# OpenRC：没有 systemd。acme.sh 需要 cron 或等价物才能定时。
+	if need_cmd crontab; then
+		# 用 acme.sh 自带的 --install-cronjob 最稳：它写的是它自己认识的那条。
+		local bin=""
+		bin=$(detect_acme_sh) || bin="${ACME_BIN}"
+		if "${bin}" --install-cronjob >>"${DEPLOY_LOG}" 2>&1; then
+			ok "续期 cron 任务已安装（OpenRC 环境）"
+			RENEW_METHOD="cron"
+			return 0
+		fi
+		warn "acme.sh 的 --install-cronjob 失败"
+	fi
+	# 走到这里说明 OpenRC 且没有可用的 cron —— 明确警告，不假装成功
+	warn "本机是 OpenRC 且没有可用的 cron，无法自动续期！"
+	warn "  acme.sh 已装好，但证书到期前需要你手动执行一次："
+	warn "    ${ACME_BIN} --cron --home ${ACME_HOME}"
+	warn "  或者先装个 cron（如：apk add busybox-initscripts && rc-update add crond）"
+	RENEW_METHOD="none"
+	return 0
+}
+
+# 用 acme.sh 申请证书并装到统一落点。这是 --cert-mode acme 的核心动作。
+# 关键点（都在真机上踩过/核对过源码）：
+#   · 默认签 ECDSA 证书 → 所有后续命令都要带 --ecc，证书目录是 <域名>_ecc
+#   · --issue 在「域名没变、未到续期窗口」时返回 2（RENEW_SKIP），不是 0 ——
+#     所以不能写 `--issue ... || return 1`，那会把正常跳过误报成失败
+#   · 装证书时用 --fullchain-file / --key-file / --ca-file 把文件落到
+#     /etc/ssl/naiveproxy/，并用 --reloadcmd 指向我们的 reload 脚本
+issue_cert_with_acme() {
+	local bin="" domain="${DOMAIN}"
+	local server="letsencrypt"
+	[ "${ACME_STAGING}" = "yes" ] && server="letsencrypt_test"
+
+	bin=$(detect_acme_sh) || { err "找不到 acme.sh"; return 1; }
+	[ -n "${CF_TOKEN}" ] || { err "acme.sh 申请证书需要 Cloudflare token（--cf-token-file 或 CF_Token 环境变量）"; return 1; }
+
+	mkdir -p "${CERT_DIR}" || { err "创建 ${CERT_DIR} 失败"; return 1; }
+	chmod 0750 "${CERT_DIR}" 2>/dev/null || true
+
+	note "用 acme.sh 向 ${server} 申请 ${domain} 的证书（DNS-01 / Cloudflare）…"
+	note "  走 DNS-01 就不需要 80 端口 —— 域名不必暴露 HTTP。"
+
+	# dns_cf 插件从环境变量读 token。export 出去，acme.sh 会自己存进 account.conf，
+	# 之后续期（timer 触发）不再依赖我们注入环境变量。
+	local rc=0
+	CF_Token="${CF_TOKEN}" "${bin}" --issue --dns dns_cf -d "${domain}" \
+		--server "${server}" --keylength ec-256 >>"${DEPLOY_LOG}" 2>&1 || rc=$?
+	if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+		err "acme.sh 申请证书失败（退出码 ${rc}）"
+		show_log_tail 20
+		err "  常见原因：Cloudflare token 权限不足 / 域名不在该账号下 / A 记录未生效"
+		return 1
+	fi
+	if [ "$rc" -eq 2 ]; then
+		note "证书已在有效期内，acme.sh 跳过本次申请（正常）"
+	fi
+
+	# 装到统一落点。--ecc 必须带：不带的话 certbot 风格的目录会找不到证书
+	# （证书在 <域名>_ecc/ 下）。
+	# --reloadcmd 指向我们生成的 reload 脚本：续期成功后 acme.sh 会自己调它，
+	# 由它用 caddy reload --force 把新证书真正换进进程。
+	if ! CF_Token="${CF_TOKEN}" "${bin}" --install-cert -d "${domain}" --ecc \
+		--fullchain-file "${CERT_FILE}" \
+		--key-file "${CERT_KEY_FILE}" \
+		--ca-file "${CERT_CHAIN_FILE}" \
+		--reloadcmd "${ACME_RELOAD_SH}" >>"${DEPLOY_LOG}" 2>&1; then
+		err "acme.sh 安装证书到 ${CERT_DIR} 失败"
+		show_log_tail 15
+		return 1
+	fi
+	ok "证书已申请并安装到 ${CERT_DIR}/"
+	return 0
+}
 
 # ---------------- 配置渲染 ----------------
 render_log_block() {
@@ -1174,12 +1720,45 @@ remove_local_hosts_hack() {
 	return 0
 }
 
+# 我们自己管的证书目录（acme.sh 那一路）用固定布局，直接设成确定的权限，
+# 不走 ensure_cert_readable 那套「试探着放开 o+rx」的兜底逻辑 ——
+# o+rx 是给 certbot 的 /etc/letsencrypt 用的；我们自己的目录应当是
+# 750 root:caddy + 私钥 640，让别人连目录都进不去。
+normalize_cert_layout() {
+	[ -d "${CERT_DIR}" ] || return 0
+	chown root:caddy "${CERT_DIR}" 2>/dev/null || true
+	chmod 0750 "${CERT_DIR}" 2>/dev/null || true
+	local f=""
+	for f in "${CERT_FILE}" "${CERT_CHAIN_FILE}"; do
+		[ -f "$f" ] || continue
+		chown root:caddy "$f" 2>/dev/null || true
+		chmod 0644 "$f" 2>/dev/null || true
+	done
+	if [ -f "${CERT_KEY_FILE}" ]; then
+		chown root:caddy "${CERT_KEY_FILE}" 2>/dev/null || true
+		chmod 0640 "${CERT_KEY_FILE}" 2>/dev/null || true
+	fi
+	return 0
+}
+
 # 证书文件必须对 caddy 用户可读，否则服务起不来。
 # 最常见的来源：certbot 把 /etc/letsencrypt/archive 放在 root:root 0700，
 # 而 caddy 以非特权用户运行 —— 真机实测会直接 permission denied 然后崩溃重启。
 ensure_cert_readable() {
 	[ -n "${TLS_CERT_FILE}" ] || return 0
 	id caddy >/dev/null 2>&1 || return 0
+
+	# 我们自己的证书目录有确定布局，直接按它收敛权限，不需要下面的「试探」
+	if [ "${TLS_CERT_FILE}" = "${CERT_FILE}" ]; then
+		normalize_cert_layout
+		if runuser -u caddy -- test -r "${TLS_CERT_FILE}" 2>/dev/null \
+		   && runuser -u caddy -- test -r "${TLS_KEY_FILE}" 2>/dev/null; then
+			return 0
+		fi
+		warn "caddy 用户读不到 ${CERT_DIR} 里的证书，自动修权限没成功"
+		warn "  手动检查：sudo ls -l ${CERT_DIR}"
+		return 0
+	fi
 
 	# 先看 caddy 用户能不能真的读到（这才是判据，不看权限位猜）
 	if runuser -u caddy -- test -r "${TLS_CERT_FILE}" 2>/dev/null \
@@ -1402,6 +1981,16 @@ write_config() {
 			CLIENT_PROTO="${STATE_CLIENT_PROTO:-$CLIENT_PROTO}"
 			TLS_CERT_FILE="${STATE_TLS_CERT:-$TLS_CERT_FILE}"
 			TLS_KEY_FILE="${STATE_TLS_KEY:-$TLS_KEY_FILE}"
+			# 现有配置是怎么管证书的，重跑时要沿用 —— 否则「保留配置」的这条
+			# 幂等路径会把 CERT_MODE_ACTUAL 落回 auto，后面 install_service
+			# 判断「要不要装续期」就会错。
+			if [ -n "${STATE_CERT_MODE:-}" ]; then
+				CERT_MODE_ACTUAL="${STATE_CERT_MODE}"
+			else
+				# 旧版本写的状态文件没有这个键，或者状态文件压根读不到。
+				# 不猜 —— 摘要里如实说「不知道」，并给出查看办法。
+				CERT_MODE_KNOWN="no"
+			fi
 			if [ -n "$NAIVE_PASS" ]; then
 				CREDS_KNOWN="yes"
 				ok "已从上次部署记录恢复账号: ${NAIVE_USER}"
@@ -1431,6 +2020,18 @@ write_config() {
 				NAIVE_PASS=$(gen_password 28)
 				note "未指定密码，已自动生成 28 位 —— 部署结束时会显示，留意最后一屏"
 			fi
+		fi
+		# acme.sh 那一路：先把证书申请/装好，再把渲染器的证书路径指过去。
+		# 顺序很重要 —— 证书必须先就位，否则下面 caddy validate 会因为
+		# Caddyfile 里引用了不存在的证书文件而失败。
+		if [ "${CERT_MODE_ACTUAL}" = "acme" ]; then
+			acme_prepare || { err "准备 acme.sh 失败"; return 1; }
+			issue_cert_with_acme || { err "用 acme.sh 申请证书失败"; return 1; }
+			TLS_CERT_FILE="${CERT_FILE}"
+			TLS_KEY_FILE="${CERT_KEY_FILE}"
+			# 申请阶段 acme.sh 的 --reloadcmd 已经跑过一次（那时 caddy 还没配好，
+			# 失败很正常）；这里再正规地修一次权限，确保后续 caddy 能读到。
+			normalize_cert_layout
 		fi
 		render_caddyfile "$DOMAIN" "$EMAIL" "$NAIVE_USER" "$NAIVE_PASS" "$HTTPS_PORT" "$ALLOW_PORTS" "$PROBE_SECRET" "$PAC_PATH" "$TLS_CERT_FILE" "$TLS_KEY_FILE" > "${CONF_FILE}" \
 			|| { err "写入 ${CONF_FILE} 失败"; return 1; }
@@ -1558,6 +2159,10 @@ install_service() {
 		err "没找到 systemd 或 openrc"
 		return 1
 	fi
+	# acme.sh 那一路才需要装续期机制。文件模式与 caddy 自签都不归我们管续期。
+	if [ "${CERT_MODE_ACTUAL}" = "acme" ]; then
+		install_renewal
+	fi
 }
 
 # ---------------- 阶段 7: 验证 ----------------
@@ -1603,12 +2208,22 @@ verify_deployment() {
 		verify_warn "本机 HTTPS 握手"
 	fi
 
-	issuer=$(echo | openssl s_client -connect "127.0.0.1:${HTTPS_PORT}" -servername "${DOMAIN}" 2>/dev/null \
-		| openssl x509 -noout -issuer 2>/dev/null || true)
+	# 证书判据必须是「TLS 握手里读到的那张」，不能看盘上文件 —— 这正是事实 1
+	# 那个坑的教训：systemctl reload 之后盘上的文件是新的，握手读到的却是旧的。
+	# 一次 s_client 抓下来，subject / issuer / 到期时间都从同一张证书取，避免不一致。
+	local hs_cert=""
+	hs_cert=$(echo | openssl s_client -connect "127.0.0.1:${HTTPS_PORT}" -servername "${DOMAIN}" 2>/dev/null \
+		| openssl x509 -noout -subject -issuer -enddate 2>/dev/null || true)
+	issuer=$(printf '%s' "$hs_cert" | sed -n 's/^issuer=//p' | head -1)
+	local hs_subject="" hs_end=""
+	hs_subject=$(printf '%s' "$hs_cert" | sed -n 's/^subject=//p' | head -1)
+	hs_end=$(printf '%s' "$hs_cert" | sed -n 's/^notAfter=//p' | head -1)
 	if [ -n "$issuer" ]; then
-		ok "证书签发者: ${issuer}"
+		ok "握手证书签发者: ${issuer}"
+		[ -n "$hs_subject" ] && note "  DNS 名: ${hs_subject}"
+		[ -n "$hs_end" ] && note "  到期时间: ${hs_end}"
 	else
-		warn "读不到证书信息（多半是证书还没签发完）"
+		warn "读不到握手里的证书信息（多半是证书还没签发完）"
 		verify_warn "证书信息"
 	fi
 
@@ -1666,6 +2281,94 @@ mask_conf_password() { # 读出配置但把密码打码
 	sed 's/^\([[:space:]]*basic_auth[[:space:]]\{1,\}[^[:space:]]\{1,\}[[:space:]]\{1,\}\).*$/\1********/' "$1"
 }
 
+# 体检里的「证书会怎么走」预演。只读 —— 不装任何东西、不申请任何证书。
+# 与正式部署共用 resolve_cert_mode，所以这里说的就是部署时真会发生的事。
+report_cert_plan() {
+	local bin="" mode=""
+	printf '\n'
+	note "证书处理方式（--cert-mode ${CERT_MODE}）"
+	mode="${CERT_MODE_ACTUAL:-$(resolve_cert_mode)}"
+	case "$mode" in
+		file)
+			ok "用你指定的证书文件（不消耗任何 ACME 额度）"
+			info "    ${TLS_CERT_FILE}"
+			;;
+		acme)
+			bin=$(detect_acme_sh || true)
+			if [ -n "$bin" ]; then
+				ok "机器上已有 acme.sh（${bin}），将用它申请 Let's Encrypt 证书"
+			else
+				note "机器上没有 acme.sh —— 正式部署时会自动装上（用户要求：没有就装）"
+				info "  ${G_ARROW} 安装需要能访问 https://get.acme.sh"
+			fi
+			info "    证书落点: ${CERT_DIR}/"
+			if [ "${INIT}" = "systemd" ]; then
+				ok "续期方式: systemd timer（每天检查一次，自动续）"
+			elif need_cmd crontab; then
+				ok "续期方式: cron"
+			else
+				# 不谎称是 OpenRC —— INIT 可能是空的（本机既没 systemd 也没 openrc）
+				warn "续期方式: 本机没有可用的定时机制（无 systemd，也无 cron）—— 无法自动续期"
+				info "  ${G_ARROW} 装上 cron 或改用有 systemd 的系统；在那之前需要手动续期："
+				info "    sudo ${ACME_BIN} --cron --home ${ACME_HOME}"
+			fi
+			;;
+		*)
+			if [ -n "${EMAIL:-}" ]; then
+				ok "交给 Caddy 自己向 Let's Encrypt 申请（HTTP-01，需要 80 端口可达）"
+			else
+				note "没有邮箱也没有 acme.sh —— 会退回自签证书（tls internal）"
+				info "  ${G_ARROW} 自签证书客户端不信任，仅适合内网测试。正式用请加 --email 或 --cf-token-file"
+			fi
+			;;
+	esac
+	return 0
+}
+
+# 证书模式的人话说明。用户最关心两件事：证书是谁签的、会不会自动续期。
+# 这一段刻意不打印任何密钥内容，只讲模式和续期机制。
+print_cert_summary() {
+	printf '%s\n' "  ${C_BLD}证书${C_RST}"
+	if [ "${CERT_MODE_KNOWN}" != "yes" ]; then
+		note "  现有配置保留着，但凭据/状态记录缺失，无法确认它用的是哪种证书方式"
+		info "  查看办法: sudo grep -n 'tls ' ${CONF_FILE}"
+		printf '\n'
+		return 0
+	fi
+	case "${CERT_MODE_ACTUAL}" in
+		acme)
+			info "  方式      acme.sh 申请（Let's Encrypt，DNS-01）"
+			info "  落点      ${CERT_DIR}/"
+			case "${RENEW_METHOD}" in
+				systemd)
+					info "  自动续期  已开启（systemd timer，每天检查一次）"
+					note "           查看状态: systemctl list-timers acme-sh-renew.timer"
+					;;
+				cron)
+					info "  自动续期  已开启（cron）"
+					;;
+				*)
+					warn "  自动续期  未开启 —— 证书到期前需要手动执行："
+					warn "            ${ACME_BIN} --cron --home ${ACME_HOME}"
+					warn "            （建议尽快装上 cron 或改用 systemd 环境）"
+					;;
+			esac
+			note "           想立刻手动续一次: sudo ${ACME_BIN} --cron --home ${ACME_HOME}"
+			;;
+		file)
+			info "  方式      使用你提供的现成证书文件"
+			info "  证书      ${TLS_CERT_FILE}"
+			info "  私钥      ${TLS_KEY_FILE}"
+			note "           续期由提供证书的那个工具负责（certbot / acme.sh 等），本脚本不管"
+			;;
+		*)
+			info "  方式      Caddy 自动向 Let's Encrypt 申请（HTTP-01）"
+			note "           续期由 Caddy 自己负责，通常无需你干预"
+			;;
+	esac
+	printf '\n'
+}
+
 print_summary() {
 	local host="${DOMAIN}"
 	if [ "$HTTPS_PORT" != "443" ]; then host="${DOMAIN}:${HTTPS_PORT}"; fi
@@ -1695,6 +2398,9 @@ print_summary() {
 	info "  端口      ${HTTPS_PORT}"
 	info "  配置文件  ${CONF_FILE}"
 	info "  日志      ${LOG_DIR}/access.log"
+
+	# 证书这一环单独说清楚：用户最关心的两个问题是「谁签的」和「会不会自动续」。
+	print_cert_summary
 
 	if [ "$CREDS_KNOWN" = "yes" ]; then
 		printf '%s\n' "  ${C_BLD}账号密码${C_RST}"
@@ -1777,9 +2483,13 @@ do_uninstall() {
 	fi
 
 	if [ "$INIT" = "systemd" ]; then
+		# 先拆我们自己的续期 timer —— 否则它会每天照常跑，而 caddy 已经没了。
+		if [ -f "${ACME_TIMER}" ]; then
+			systemctl disable --now acme-sh-renew.timer 2>/dev/null || true
+		fi
 		systemctl stop caddy 2>/dev/null || true
 		systemctl disable caddy 2>/dev/null || true
-		rm -f "${SVC_FILE}"
+		rm -f "${SVC_FILE}" "${ACME_TIMER}" "${ACME_SERVICE}"
 		systemctl daemon-reload 2>/dev/null || true
 	elif [ "$INIT" = "openrc" ]; then
 		rc-service caddy stop 2>/dev/null || true
@@ -1799,7 +2509,18 @@ do_uninstall() {
 		rm -rf "${LOG_DIR}" "${DATA_DIR}"
 		if id caddy >/dev/null 2>&1; then userdel -r caddy 2>/dev/null || true; fi
 		rm -f "${CADDY_BIN}"
+		# 只删「本脚本生成的」东西。刻意不删 acme.sh 本身，也不删它签的证书 ——
+		# acme.sh 可能还在给这台机器上的别的域名管证书，连根拔掉会伤到用户。
+		rm -f "${ACME_RELOAD_SH}"
 		ok "已清理配置、站点、日志、数据与 caddy 用户"
+		if [ -d "${CERT_DIR}" ]; then
+			warn "保留了证书目录 ${CERT_DIR}（重装可复用它，省一次 Let's Encrypt 额度）"
+			warn "  确实要删：sudo rm -rf ${CERT_DIR}"
+		fi
+		if [ -d "${ACME_HOME}" ]; then
+			note "acme.sh 本身（${ACME_HOME}）也保留了 —— 它可能还在管别的域名"
+			note "  确实要删：sudo ${ACME_BIN} --uninstall && sudo rm -rf ${ACME_HOME}"
+		fi
 	else
 		note "配置与数据已保留（彻底清理请加 --purge）"
 	fi
@@ -1826,6 +2547,9 @@ do_rotate_password() {
 	CLIENT_PROTO="${STATE_CLIENT_PROTO:-https}"
 	TLS_CERT_FILE="${STATE_TLS_CERT:-}"
 	TLS_KEY_FILE="${STATE_TLS_KEY:-}"
+	# 换密码要重写整个 Caddyfile，证书这一环必须沿用原来的处理方式，
+	# 否则 A 模式部署的机器一次换密码就可能把证书路径改没了。
+	CERT_MODE_ACTUAL="${STATE_CERT_MODE:-${CERT_MODE_ACTUAL}}"
 	if [ -z "$DOMAIN" ]; then
 		die "凭据记录里没有域名，无法重写配置"
 	fi
@@ -2012,12 +2736,23 @@ do_check() {
 		note "当前不是 root —— 体检不需要，但正式部署要加 sudo"
 	fi
 
+	# 7) 证书会怎么走 —— 这是用户最容易一头雾水的一环，体检里必须预演一遍
+	report_cert_plan
+
 	# 配置预览
 	if [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
 		section "配置预览"
 		note "密码位置是占位符 —— 正式部署时才会生成真密码"
 		printf '\n'
-		render_caddyfile "$DOMAIN" "$EMAIL" "${NAIVE_USER:-naive}" "${PASS_PREVIEW}" "${HTTPS_PORT:-443}" "$ALLOW_PORTS" "$PROBE_SECRET" "$PAC_PATH" "$TLS_CERT_FILE" "$TLS_KEY_FILE"
+		# 预览必须与实际会渲染出的配置一致。acme 模式下正式部署会把 tls 指到
+		# 统一落点的证书文件，预览也要照这个来 —— 否则用户看到的 `tls <邮箱>`
+		# 和实际写进去的证书路径对不上，等于预览在说谎。
+		local pv_cert="${TLS_CERT_FILE}" pv_key="${TLS_KEY_FILE}"
+		if [ "${CERT_MODE_ACTUAL:-}" = "acme" ]; then
+			pv_cert="${CERT_FILE}"; pv_key="${CERT_KEY_FILE}"
+			note "acme 模式：证书会由 acme.sh 申请并装到 ${CERT_DIR}/ ，配置里引用这两个文件"
+		fi
+		render_caddyfile "$DOMAIN" "$EMAIL" "${NAIVE_USER:-naive}" "${PASS_PREVIEW}" "${HTTPS_PORT:-443}" "$ALLOW_PORTS" "$PROBE_SECRET" "$PAC_PATH" "$pv_cert" "$pv_key"
 		printf '\n'
 		info "客户端 config.json 会是这样："
 		render_client_config "${NAIVE_USER:-naive}" "${PASS_PREVIEW}" "$DOMAIN" "${HTTPS_PORT:-443}" "$CLIENT_PROTO" | sed 's/^/    /'
@@ -2064,6 +2799,35 @@ do_upgrade() {
 	ok "升级完成，配置未改动"
 }
 # ---------------- 参数校验 ----------------
+# 证书模式相关选项的校验。--check（只读体检）与正式部署两条路径都调用它，
+# 免得又出现「体检打绿勾、部署才炸」的覆盖漂移。
+validate_cert_options() {
+	validate_cert_mode "${CERT_MODE}" \
+		|| die "--cert-mode 只能是 auto|acme|caddy|file，收到: ${CERT_MODE}"
+	# 显式 file 模式却没给文件 → 当场拒，别等到渲染出 tls 空指令。
+	if [ "${CERT_MODE}" = "file" ] && ! cert_files_given; then
+		die "--cert-mode file 需要同时给出 --tls-cert 与 --tls-key"
+	fi
+	# --tls-cert/--tls-key 与 --cert-mode acme/caddy 互斥：两个都给了是自相矛盾，
+	# 不如直接说清楚，别让脚本替用户猜。
+	if cert_files_given && { [ "${CERT_MODE}" = "acme" ] || [ "${CERT_MODE}" = "caddy" ]; }; then
+		die "既给了 --tls-cert/--tls-key，又指定 --cert-mode ${CERT_MODE} —— 两者冲突。去掉一个。"
+	fi
+	if [ -n "${CF_TOKEN_FILE}" ]; then
+		validate_path_value "${CF_TOKEN_FILE}" \
+			|| die "--cf-token-file 不合法: ${CF_TOKEN_FILE}（应为不含空格与换行的路径）"
+	fi
+	if [ -n "${ACME_EMAIL}" ]; then
+		validate_email "${ACME_EMAIL}" || die "--acme-email 格式不合法: ${ACME_EMAIL}"
+	fi
+	# token 文件与环境变量此时就要读进来 —— 因为下面 resolve_cert_mode 要靠
+	# CF_TOKEN 是否为空来决定 auto 模式走不走 acme.sh。
+	load_cf_token || return 1
+	# 自动/显式选定最终模式。失败时给出人话与补救命令。
+	decide_cert_mode || return 1
+	return 0
+}
+
 # 刻意不在这里生成密码 —— 预览（--check / --dry-run）不该凭空造一个
 # 永远不会被用到的密码。真密码在 write_config 里、真的要写配置时才生成。
 validate_inputs() {
@@ -2080,6 +2844,8 @@ validate_inputs() {
 	# 证书与私钥必须成对出现，且要真的配对 —— 否则 caddy 起不来。
 	# 与 --check 共用 check_tls_cert_inputs，避免两条路径的覆盖范围再次漂移。
 	check_tls_cert_inputs || die "--tls-cert 与 --tls-key 必须同时给出"
+	# 证书模式相关的选项（--cert-mode / --cf-token-file / --acme-email / CF_Token）
+	validate_cert_options || exit 1
 	validate_client_proto "$CLIENT_PROTO" \
 		|| die "--client-proto 只能是 https 或 quic，收到: ${CLIENT_PROTO}"
 	# 会成为 Caddyfile 与文件系统路径的入参。空值一律拒绝 ——
@@ -2133,6 +2899,13 @@ parse_args() {
 			--tls-cert=*) TLS_CERT_FILE="${1#*=}"; shift ;;
 			--tls-key) need_value "$1" "$#" "/etc/letsencrypt/live/example.com/privkey.pem"; TLS_KEY_FILE="$2"; shift 2 ;;
 			--tls-key=*) TLS_KEY_FILE="${1#*=}"; shift ;;
+			--cert-mode) need_value "$1" "$#" "auto"; CERT_MODE="$2"; shift 2 ;;
+			--cert-mode=*) CERT_MODE="${1#*=}"; shift ;;
+			--cf-token-file) need_value "$1" "$#" "/root/.cf-token"; CF_TOKEN_FILE="$2"; shift 2 ;;
+			--cf-token-file=*) CF_TOKEN_FILE="${1#*=}"; shift ;;
+			--acme-email) need_value "$1" "$#" "you@example.com"; ACME_EMAIL="$2"; shift 2 ;;
+			--acme-email=*) ACME_EMAIL="${1#*=}"; shift ;;
+			--acme-staging) ACME_STAGING="yes"; shift ;;
 			--check|--dry-run) CHECK_ONLY="yes"; shift ;;
 			--upgrade) MODE="upgrade"; shift ;;
 			--reload) RELOAD_ONLY="yes"; shift ;;
@@ -2145,7 +2918,16 @@ parse_args() {
 			-y|--yes) ASSUME_YES="yes"; shift ;;
 			--uninstall) MODE="uninstall"; shift ;;
 			--purge) PURGE="yes"; shift ;;
-			--self-test) SELF_TEST="yes"; shift ;;
+			--self-test)
+				SELF_TEST="yes"; shift
+				# 可选过滤模式：紧跟着的下一个参数不以 - 开头就当成模式吃掉。
+				# 不这么做，`--self-test state_` 会被当成「多余的位置参数」直接报错，
+				# 而带空格正是最顺手的写法。
+				if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+					SELF_TEST_PATTERN="$1"; shift
+				fi
+				;;
+			--self-test=*) SELF_TEST="yes"; SELF_TEST_PATTERN="${1#*=}"; shift ;;
 			-V|--version) printf '%s\n' "${SCRIPT_VERSION}"; exit 0 ;;
 			-h|--help) usage; exit 0 ;;
 			--) shift; break ;;
@@ -2206,6 +2988,9 @@ main() {
 		# 证书与私钥必须成对，且要真的配对（--check 不调用 validate_inputs，这里要单独校）。
 		# 与正式部署共用 check_tls_cert_inputs —— 否则「体检说没问题、部署立刻失败」。
 		check_tls_cert_inputs || die "--tls-cert 与 --tls-key 必须同时给出"
+		# 证书模式相关选项也要在体检里校。共用 validate_cert_options ——
+		# 它同时负责选定 CERT_MODE_ACTUAL，do_check 的预览要用这个值。
+		validate_cert_options || exit 1
 		# 本轮新增的入参在 --check 下也必须校一遍，否则体检会:
 		#   ① 渲染出一个正式部署必然拒绝的预览（实测 --probe-secret Bad.Example.COM
 		#      在预览里原样渲染成 probe_resistance Bad.Example.COM）
@@ -2265,6 +3050,145 @@ main() {
 	print_summary
 }
 
+# 区域索引的成员：从 ST_INDEX_BEGIN..ST_INDEX_END 里取出「 ～ 标题」列表，
+# 打印成一行一标题。语法见文件头那段索引的说明。
+section_index_members() {
+	awk '
+		/^# ST_INDEX_BEGIN$/ { inx = 1; next }
+		/^# ST_INDEX_END$/   { inx = 0; next }
+		!inx { next }
+		{
+			sub(/^#[ \t]*～[ \t]*/, "")
+			gsub(/[ \t]+$/, "")
+			print
+		}
+	' "$0"
+}
+
+# 源码里全部顶格区段标题（列首的 `# ---- 标题 ----`），按出现顺序。
+# 只认列首：函数体内缩进的同类注释不是区段，混进来会让下面的比对假红。
+section_index_titles() {
+	awk '/^# -{16}.*-{16}[ \t]*$/ {
+		sub(/^# -+[ \t]*/, ""); sub(/[ \t]*-+[ \t]*$/, ""); print
+	}' "$0"
+}
+
+# 索引必须与源码里的区段标题「逐条一致且同序」。任一侧多一条、少一条、
+# 换来顺序都会红 —— 这才叫索引没漂；只对字数或首尾的弱断言挡不住漂。
+# 预期索引「永远含自身这条」，因为它就是一条顶格区段。
+index_lists_all_sections() {
+	local want="" got=""
+	want=$(section_index_titles)
+	got=$(section_index_members)
+	if [ "$want" = "$got" ]; then
+		return 0
+	fi
+	printf '  区域索引与源码区段标题不一致（- 索引应有 / + 索引实有）：\n' >&2
+	diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/    /' >&2
+	return 1
+}
+
+# 索引里不许出现裸行号（如「阶段 1: 系统依赖 1613」）。那些行号是随手行号，
+# 唯一的效果就是改一次文件就漂一次。要稳定只能靠标题。
+# 注意别误判标题里的数字：「阶段 1」这种短数字不算行号，所以只逮 3 位以上
+# 或者是「标题 空格 数字」这种行号形状。
+index_has_line_numbers() {
+	local hits=""
+	hits=$(section_index_members \
+		| grep -nE '[^0-9][0-9]{3,}[[:space:]]*$|[[:space:]][0-9]{1,4}[[:space:]]*$' || true)
+	if [ -z "$hits" ]; then
+		return 1
+	fi
+	printf '  索引里出现了疑似行号的数字：\n%s\n' "$hits" >&2
+	return 0
+}
+
+# 下面这几条会起子进程跑 --self-test。子进程一律带 AMIA_ST_NESTED=1：
+# 过滤正常时子进程只跑命中的小段（如 [2] 密码生成），根本到不了本节；
+# 但过滤要是坏了（证伪实验①：st_want/st_match 永远返回 0），子进程会跑满全量、
+# 再一次进本节、又去起子进程 —— 不拦就是无限链，一路 spawn 到把机器拖垮。
+# 本节的断言见到这个旗标就只跳过、不下蛋。
+_self_test_nested_skip() {
+	if [ "${AMIA_ST_NESTED:-0}" = "1" ]; then
+		printf '  跳过：处于子集自检的子进程内（防递归）\n' >&2
+		return 0
+	fi
+	return 1
+}
+
+# 行为级：子集过滤命中关键词时必须真的跑、并且退出 0。
+# 这条起真子进程，但只跑「密码生成」这种小模式（实测 < 1 秒）；
+# 绝不能拿全量断言起子进程，那等于自检里嵌自检、把进程生灭翻倍。
+self_test_subset_hits() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	out=$(AMIA_ST_NESTED=1 bash "$0" --self-test "密码生成" 2>&1) || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf '  期望子集自检命中时退出 0，实得 %s。输出：\n%s\n' "$rc" "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q '子集自检：模式'; then
+		printf '  命中时未打印子集自检的行首提示。输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级：关键词一条都匹配不上时必须「报错 + 非 0 退出」。
+# 这是本项目反复踩的假通过 —— 静默跑 0 条还报全过，等于自检根本没跑。
+# 这条断言就是给「零命中要报错」那段逻辑上的锁。
+self_test_subset_missing_errors() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	out=$(AMIA_ST_NESTED=1 bash "$0" --self-test "zzz不存在的关键词zzz" 2>&1) || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		printf '  期望零命中时报错退出，实得 0。输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q '没有任何断言匹配'; then
+		printf '  零命中时未给出「没有任何断言匹配」的提示。输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级：子集必须「只跑命中的区段」——不多跑。这条是给「过滤静默失效」上的锁。
+# 报数行（命中 N / 共 M、另有 K 条被过滤）是 awk 单独扫出来的，跟实际执行无关：
+# 过滤整个坏掉时它照样印得漂漂亮亮。所以只能看行为——数真跑出来的区段标题：
+# 过滤在，跑「密码生成」只会印 [2] 一个区段；过滤没了（证伪实验①），19 个区段全印。
+# 不用「PASS 条数 ≤ 报数」比：报数自身对 [2] 少算一条（既有实现的老毛病，本任务不动），
+# 拿它当基准会把一条正确的实现判红。
+self_test_subset_isolates_sections() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0 nsec=0 total=0
+	out=$(AMIA_ST_NESTED=1 bash "$0" --self-test "密码生成" 2>&1) || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf '  子集自检退出 %s。输出：\n%s\n' "$rc" "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q '\[2\] 密码生成'; then
+		printf '  子集没跑到目标区段 [2] 密码生成。输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	# 真跑出来的区段数（只认 `[N] 标题` 的行首形态，PASS 行不会命中）。
+	nsec=$(printf '%s' "$out" | grep -cE '^\[[0-9]+\] ')
+	total=$(printf '%s' "$out" | sed -n 's/.*共 \([0-9][0-9]*\) 条断言.*/\1/p')
+	if [ -z "$total" ]; then
+		printf '  读不到报数行里的「共 N 条断言」。输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	# 上限 2：目标区段 [2] 一个，外加一点余地。过滤正常时是 1，
+	# 过滤失效时是整个区段数（十几到二十几），差了一个数量级。
+	if [ "$nsec" -gt 2 ]; then
+		printf '  子集跑了 %s 个区段（共 %s 条断言），远超命中范围 —— 过滤没生效。\n' \
+			"$nsec" "$total" >&2
+		printf '  实际跑到的区段：\n%s\n' \
+			"$(printf '%s' "$out" | grep -E '^\[[0-9]+\] ' | sed 's/^/    /')" >&2
+		return 1
+	fi
+	return 0
+}
+
 # ---------------- 自检用的顶层辅助 ----------------
 # 取源码里某个函数的函数体，用于结构性断言（放顶层，供多个辅助函数复用）
 fn_body() {
@@ -2297,6 +3221,17 @@ fn_body() {
 			if ($0 ~ /^\}[[:space:]]*$/) { exit }
 		}
 	' "$0"
+}
+
+# 取函数体，但剥掉注释行。
+# 为什么需要：代码级断言（「这里必须调用 X」「这里必须带 --ecc」）如果直接
+# 在含注释的函数体上匹配，注释里那句解释性的话会把断言「喂饱」——
+# 于是把真正的命令行删掉、断言依然绿。证伪实验实测到过两次：
+#   --install-cert ... --ecc 被删（注释里还留着「--ecc 必须带」）→ 断言仍通过
+#   openssl s_client 被换成读盘上的文件（注释里还留着「s_client」）→ 断言仍通过
+# 所以要断「代码里有没有」，就必须先把注释去掉。
+fn_code() {
+	fn_body "$1" | grep -v '^[[:space:]]*#' || true
 }
 
 # 行为级验证：run_stage 必须把真实的退出码传给 fail_stage。
@@ -2345,6 +3280,43 @@ is_valid_json() {
 }
 
 test_not_exists() { [ ! -e "$1" ]; }
+
+# 行为级：OpenRC 且没有 cron 时，install_renewal 必须「警告 + 标记 none」，
+# 绝不能返回 0 又不设 RENEW_METHOD（那会让摘要谎称续期已开）。
+# 把 install_renewal 挪进子 shell 跑一次，观察它的输出与 RENEW_METHOD。
+no_fake_renewal_on_openrc() {
+	local lib="" out="" rc=0
+	# 用 source 加载主脚本会执行 main；剥掉最后那行 main "$@" 再 source
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	# shellcheck disable=SC2016  # 子 shell 里刻意用单引号延迟展开 $1
+	out=$(bash -c '
+		source "$1"
+		DEPLOY_LOG=/dev/null
+		INIT=openrc
+		# 桩：crontab 不存在（模拟真机无 cron），其余命令照常探测
+		need_cmd() { [ "$1" = crontab ] && return 1; command -v "$1" >/dev/null 2>&1; }
+		RENEW_METHOD=""
+		install_renewal >/dev/null 2>&1
+		printf "RENEW_METHOD=%s\n" "${RENEW_METHOD}"
+	' _ "$lib" 2>/dev/null) || rc=$?
+	rm -f "$lib"
+	if printf '%s' "$out" | grep -q '^RENEW_METHOD=none$'; then
+		return 0
+	fi
+	printf '  期望 OpenRC 无 cron 时 RENEW_METHOD=none。实际输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+# 许可证边界（MIT 仓库不得混入 GPL-3.0 的 acme.sh 实现）。
+# 判据：acme.sh 内部有几个标志性的、只有它自己的实现才会有的函数名。
+# 我们只调用它的 CLI，不该出现这些名字 —— 一旦出现就说明有人把它的代码搬了进来。
+# 用 grep -c 而不是 has：这里要读整个 180KB 文件，避免管道 SIGPIPE。
+no_vendored_acme() {
+	local n=""
+	n=$(grep -cE '^_initpath\(\)|^_send_signed_request\(\)|^_readaccountconf_mutable\(\)|^_createkey\(\)' "$0" 2>/dev/null || true)
+	[ "${n:-0}" -eq 0 ]
+}
 
 # 状态文件绝不能再被 source（那是把数据当代码执行）。
 # 注意这里的正则写在 grep 的参数里，而本行以 `hits=` 开头 —— 不会自匹配。
@@ -2395,6 +3367,26 @@ stage7_advice_honest() {
 	return 0
 }
 
+# 自检结束时的统计行。全量与子集共用同一个格式化点，避免两处文案各改各的。
+# 参数: <通过> <失败> <跳过> <被过滤>；被过滤 >0 时才追加说明。
+self_test_report() {
+	printf '\n----------------------------------------\n'
+	if [ "$4" -gt 0 ]; then
+		printf '结果: %s%s 通过%s / %s%s 失败%s / %s%s 跳过%s（另有 %s 条被过滤）\n' \
+			"$C_GRN" "$1" "$C_RST" "$C_RED" "$2" "$C_RST" "$C_YEL" "$3" "$C_RST" "$4"
+	else
+		printf '结果: %s%s 通过%s / %s%s 失败%s / %s%s 跳过%s\n' \
+			"$C_GRN" "$1" "$C_RST" "$C_RED" "$2" "$C_RST" "$C_YEL" "$3" "$C_RST"
+	fi
+	if [ "$2" -ne 0 ]; then
+		printf '%s\n' "自检未通过，请勿部署。"
+		return 1
+	fi
+	printf '%s\n' "自检全部通过。"
+	return 0
+}
+
+
 self_test() {
 	local pass=0 fail=0 skip=0 rc=0
 
@@ -2426,6 +3418,9 @@ self_test() {
 	}
 
 	has() { printf '%s' "$1" | grep -qE "$2"; }
+	# has 的反面。单独定义是因为 false_case 看的是「退出码非 0」，
+	# 而管道 + pipefail 下 grep 无匹配本来就是非 0，语义正好对得上。
+	not_has() { printf '%s' "$1" | grep -qE "$2" && return 1; return 0; }
 
 	skip_case() { printf '  %sSKIP%s %s\n' "$C_YEL" "$C_RST" "$1"; skip=$((skip + 1)); }
 
@@ -2433,15 +3428,120 @@ self_test() {
 	brace_r() { printf '%s' "$1" | tr -cd '}' | wc -c | tr -d ' '; }
 
 	tab_indent_ok() { printf '%s' "$1" | grep -q "^$(printf '\t')"; }
+# ---------------- 子集过滤（--self-test <模式>） ----------------
+	# 现有 385 条断言一行都没动，过滤是这么实现的：
+	#   ① 区段级 —— 断言区以 `[N] 标题` 分段，整段不匹配就整段不执行，
+	#      连段内的准备代码（建临时目录 / 渲染配置 / 签证书）一起省掉；
+	#   ② 断言级 —— 段里不匹配的断言，交给辅助函数时直接不跑也不计数。
+	#      这一层非有不可：断言把子进程当「尾随参数」传（如 `bash "$0" --check`），
+	#      子进程只在辅助函数内部才起，不拦在这里就照样要跑满几秒。
+	# 一条断言会被执行，当且仅当：断言那一行含关键词，或它所在区段的标题含关键词。
+	# 被过滤掉的不算「跳过」、也不计失败，所以不影响退出码。help 口径与此一致。
+	st_total=0 st_kept=0 st_secs="" st_lines=""
+
+	st_want() { # <区段号> —— 这一段要不要跑
+		if [ -z "${SELF_TEST_PATTERN}" ]; then return 0; fi
+		case " ${st_secs} " in
+			*" $1 "*) return 0 ;;
+		esac
+		return 1
+	}
+	st_match() { # <源码行号> —— 这一条断言要不要跑
+		if [ -z "${SELF_TEST_PATTERN}" ]; then return 0; fi
+		case " ${st_lines} " in
+			*" $1 "*) return 0 ;;
+		esac
+		return 1
+	}
+
+	if [ -n "${SELF_TEST_PATTERN}" ]; then
+		local st_scan=""
+		# 扫源码一次：得出断言总数、要跑的断言行号、要保留的区段号。
+		# 用 $0 而不是函数体 —— 行号必须与 BASH_LINENO 对得上，否则断言级过滤会错位。
+		# 认区段标题只认 `printf '...\n[数字] ...'`：本函数里还有别的 printf
+		# （打印状态文件内容、拼渲染结果），放宽了会把它们当成区段标题，编号一错，
+		# 过滤就整个失效 —— 而且会静默失效（跑 0 条还报全过）。
+		# shellcheck disable=SC2016  # awk 程序里的 $0/NR 交给 awk，不是 shell 变量
+		st_scan=$(awk -v pat="${SELF_TEST_PATTERN}" '
+			/^# ST_ASSERT_BEGIN$/ { inb = 1; next }
+			/^# ST_ASSERT_END$/   { inb = 0; next }
+			!inb { next }
+			{
+				if ($0 ~ /^[ \t]*printf .*\[[0-9]+\]/) {
+					nsec++
+					if (index(tolower($0), tolower(pat)) > 0) hit[nsec] = 1
+					next
+				}
+				if ($0 ~ /^[ \t]*(true|false|eq|skip)_case /) {
+					na++
+					aln[na] = NR
+					asec[na] = nsec
+					if (index(tolower($0), tolower(pat)) > 0) amatch[na] = 1
+				}
+			}
+			END {
+				kept = 0; secs = ""; lns = ""
+				# 一条断言要跑：自己的行命中，或所在区段标题命中（两者独立）。
+				for (i = 1; i <= na; i++) {
+					if (amatch[i] || hit[asec[i]]) { kept++; lns = lns " " aln[i] }
+				}
+				# 区段只有当它「还有要跑的断言」时才保留。注意不能用「标题命中」
+				# 当保留条件：关键词是 state_ 这种标识符时根本没标题命中，
+				# 那样会把所有区段都跳过，跑 0 条还报全过 —— 正是要避免的假通过。
+				for (s = 1; s <= nsec; s++) {
+					for (i = 1; i <= na; i++) {
+						if (asec[i] == s && (amatch[i] || hit[s])) { secs = secs " " s; break }
+					}
+				}
+				printf "TOTAL %d\nKEPT %d\nSECS%s\nLINES%s\n", na, kept, secs, lns
+			}
+		' "$0") || st_scan=""
+		st_total=$(printf '%s\n' "$st_scan" | sed -n 's/^TOTAL //p')
+		st_kept=$(printf '%s\n' "$st_scan" | sed -n 's/^KEPT //p')
+		st_secs=$(printf '%s\n' "$st_scan" | sed -n 's/^SECS//p')
+		st_lines=$(printf '%s\n' "$st_scan" | sed -n 's/^LINES//p')
+		# 一条都没匹配上必须当场报错：否则 --self-test typo 会「跑 0 条、报全过」，
+		# 正是本项目反复踩的那种假通过。
+		if [ "${st_kept:-0}" -eq 0 ]; then
+			err "没有任何断言匹配「${SELF_TEST_PATTERN}」—— 换个关键词，或去掉关键词跑全量自检"
+			return 1
+		fi
+		printf '子集自检：模式「%s」，命中 %s / 共 %s 条断言\n' \
+			"${SELF_TEST_PATTERN}" "$st_kept" "$st_total"
+		# 断言级过滤：把四个辅助函数换成「先问该不该跑、再转交原实现」的包装器。
+		# 原实现用 declare -f 拷出来（不是重写的），语义与原来逐字一致。
+		local st_fn="" st_def=""
+		for st_fn in true_case false_case eq_case skip_case; do
+			st_def=$(declare -f "$st_fn")
+			eval "_st_orig_${st_fn}${st_def#"${st_fn}"}"
+		done
+		true_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_true_case "$@"; fi
+		}
+		false_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_false_case "$@"; fi
+		}
+		eq_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_eq_case "$@"; fi
+		}
+		skip_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_skip_case "$@"; fi
+		}
+	fi
+
 
 
 	printf '%s\n' "离线自检 v${SCRIPT_VERSION}（无需 root，不修改系统）"
 
+# ST_ASSERT_BEGIN
+	if st_want 1; then
 	printf '\n[1] 语法与依赖\n'
 	true_case "bash -n 通过" bash -n "$0"
 	true_case "curl 可用" command -v curl
 	true_case "本文件有可执行位" test -x "$0"
 
+	fi
+	if st_want 2; then
 	printf '\n[2] 密码生成\n'
 	local p1="" p2=""
 	p1=$(gen_password 28)
@@ -2456,6 +3556,8 @@ self_test() {
 	fi
 	true_case "生成结果能通过密码校验" validate_password "$p1"
 
+	fi
+	if st_want 3; then
 	printf '\n[3] 校验函数 · 应当接受\n'
 	true_case "正常域名" validate_domain proxy.example.com
 	true_case "多级域名" validate_domain a.b.c.example.co.uk
@@ -2471,6 +3573,8 @@ self_test() {
 	true_case "端口白名单单项" validate_ports_list "443"
 	true_case "端口白名单多项" validate_ports_list "80 443"
 
+	fi
+	if st_want 4; then
 	printf '\n[4] 校验函数 · 应当拒绝\n'
 	false_case "空域名" validate_domain ""
 	false_case "带协议头" validate_domain "https://a.example.com"
@@ -2499,6 +3603,8 @@ self_test() {
 	false_case "端口白名单含分号" validate_ports_list "80;443"
 	false_case "端口白名单含逗号" validate_ports_list "80,443"
 	false_case "端口白名单越界" validate_ports_list "80 70000"
+	fi
+	if st_want 5; then
 	printf '\n[5] Caddyfile 渲染\n'
 	local r="" rl=""
 	r=$(render_caddyfile example.com ops@mail.test tom Abcd1234 443)
@@ -2526,6 +3632,8 @@ self_test() {
 	true_case "日志块含 roll_keep" has "$rl" 'roll_keep 5'
 	eq_case "日志块花括号配平" "$(brace_l "$rl")" "$(brace_r "$rl")"
 
+	fi
+	if st_want 6; then
 	printf '\n[6] 客户端配置\n'
 	local cj=""
 	cj=$(render_client_config tom Abcd1234 example.com 443)
@@ -2545,6 +3653,8 @@ self_test() {
 		skip_case "合法 JSON 校验（本机无可用 python）"
 	fi
 
+	fi
+	if st_want 7; then
 	printf '\n[7] 服务单元\n'
 	local u="" oc=""
 	u=$(render_systemd_unit)
@@ -2561,6 +3671,8 @@ self_test() {
 	true_case "openrc 脚本含 shebang" has "$oc" '^#!/sbin/openrc-run$'
 	true_case "openrc 保留运行时变量" has "$oc" 'RC_SVCNAME'
 
+	fi
+	if st_want 8; then
 	printf '\n[8] 阶段表一致性（编号断层曾是真 bug）\n'
 	eq_case "TOTAL_STAGES 等于阶段名数量" "$TOTAL_STAGES" "${#STAGE_NAMES[@]}"
 	eq_case "提示数与阶段数一致" "${#STAGE_NAMES[@]}" "${#STAGE_HINT[@]}"
@@ -2579,6 +3691,8 @@ self_test() {
 		true_case "stage_advice 覆盖第 ${i} 步" has "$(fn_body stage_advice)" "^${tab}${i}) cat"
 	done
 
+	fi
+	if st_want 9; then
 	printf '\n[9] 失败出口\n'
 	local fb=""
 	fb=$(fn_body fail_stage)
@@ -2593,6 +3707,8 @@ self_test() {
 	true_case "阶段内不用裸 die（会用 exit 绕开失败处理）" no_bare_die_in_stages
 	true_case "阶段失败的退出码会真实传递（曾会假报 0）" stage_rc_propagates
 
+	fi
+	if st_want 10; then
 	printf '\n[10] 用户可见行为\n'
 	true_case "--version 正常退出" bash "$0" --version
 	true_case "--help 正常退出" bash "$0" --help
@@ -2612,6 +3728,8 @@ self_test() {
 		skip_case "非 root 拦截（当前是 root）"
 	fi
 
+	fi
+	if st_want 11; then
 	printf '\n[11] 只读性与诚实性（这几条对应修掉的 bug）\n'
 	local out="" before="" after=""
 	out=$(bash "$0" 2>&1 || true)
@@ -2639,6 +3757,8 @@ self_test() {
 	after=$(find "${CONF_DIR}" "${CADDY_BIN}" -maxdepth 1 2>/dev/null | sort | tr '\n' ' ' || true)
 	eq_case "--check 没改动系统" "$before" "$after"
 
+	fi
+	if st_want 12; then
 	printf '\n[12] 敏感信息与破坏性操作\n'
 	local cb="" ub="" pb=""
 	cb=$(fn_body confirm)
@@ -2652,6 +3772,8 @@ self_test() {
 	true_case "摘要里有密码找回途径" has "$(fn_body print_summary)" 'STATE_FILE'
 	true_case "摘要把安全组标为必做" has "$(fn_body print_summary)" '必做'
 
+	fi
+	if st_want 13; then
 	printf '\n[13] 输入加固（换行 / 引号 / 分号注入）\n'
 	false_case "邮箱含单引号被拒" validate_email "$(printf '%s' "o'brien@mail.test")"
 	false_case "邮箱含分号被拒" validate_email "a;b@mail.test"
@@ -2665,6 +3787,8 @@ self_test() {
 	false_case "密码含换行被拒" validate_password "$(printf 'Aa12345678\nx')"
 	false_case "端口白名单含换行被拒" validate_ports_list "$(printf '80\n443')"
 
+	fi
+	if st_want 14; then
 	printf '\n[14] 状态文件往返与注入抵抗\n'
 	local saved_state="${STATE_FILE}" tdir=""
 	tdir=$(mktemp -d)
@@ -2707,7 +3831,11 @@ self_test() {
 	rm -rf "${tdir}"
 	STATE_FILE="${saved_state}"
 
+	fi
+	if st_want 15; then
 	printf '\n[15] 第二轮评审修复的锁定断言\n'
+	fi
+	if st_want 16; then
 	printf '\n[16] 官方文档对齐（probe-secret / serve_pac / quic）\n'
 	# 证书权限：certbot 把 archive/ 放成 root:root 0700，caddy 以非特权用户运行会读不到
 	# 真机实测：直接 permission denied + 崩溃重启
@@ -2808,6 +3936,8 @@ self_test() {
 	# 只针对 die 消息里的断言 —— 注释里提到这个词是允许的
 	false_case "rotate 的 die 消息不再谎称已回滚" has "$(fn_body do_rotate_password)" 'die "[^"]*已回滚'
 
+	fi
+	if st_want 17; then
 	printf '\n[17] 第三轮审计修复的锁定断言（路径入参注入 / 校验覆盖漂移）\n'
 	# 根因：--serve-pac 与 --web-root 的值是按行插进 heredoc 的，却从来没有校验器。
 	# 实测渲染出来的注入：
@@ -2935,15 +4065,276 @@ SSLCNF
 		skip_case "证书配对行为断言（本机无 openssl）"
 	fi
 
-	printf '\n----------------------------------------\n'
-	printf '结果: %s%d 通过%s / %s%d 失败%s / %s%d 跳过%s\n' \
-		"$C_GRN" "$pass" "$C_RST" "$C_RED" "$fail" "$C_RST" "$C_YEL" "$skip" "$C_RST"
-	if [ "$fail" -ne 0 ]; then
-		printf '%s\n' "自检未通过，请勿部署。"
-		return 1
 	fi
-	printf '%s\n' "自检全部通过。"
-	return 0
+	if st_want 18; then
+	printf '\n[18] acme.sh 证书路径（第四轮新增）\n'
+	# ---- 18a) 证书模式的取值与自动选择 ----
+	true_case "cert-mode 校验器已定义" command -v validate_cert_mode
+	true_case "接受 auto" validate_cert_mode auto
+	true_case "接受 acme" validate_cert_mode acme
+	true_case "接受 caddy" validate_cert_mode caddy
+	true_case "接受 file" validate_cert_mode file
+	false_case "拒绝空 cert-mode" validate_cert_mode ''
+	false_case "拒绝任意 cert-mode" validate_cert_mode zerossl
+	false_case "拒绝大小写不符" validate_cert_mode AUTO
+
+	# 三层降级的决策逻辑：直接测 resolve_cert_mode，不依赖本机装没装 acme.sh。
+	# 用「保存/恢复全局 + 桩函数」的方式把每条分支都跑到，避免 CI 环境差异导致漏测。
+	local sv_cert="${TLS_CERT_FILE}" sv_key="${TLS_KEY_FILE}" sv_tok="${CF_TOKEN}"
+	local mode=""
+
+	# ① 给了文件 → file（最高优先）
+	TLS_CERT_FILE="/tmp/c.pem"; TLS_KEY_FILE="/tmp/k.pem"; CF_TOKEN=""
+	eq_case "降级①：给了证书文件就选 file" "file" "$(resolve_cert_mode)"
+
+	# ② 没文件、有 token + 有 acme.sh → acme
+	# detect_acme_sh 是探测函数，用桩替代，让「有 acme.sh」这条分支可测
+	local _orig_detect_acme
+	_orig_detect_acme=$(declare -f detect_acme_sh)
+	detect_acme_sh() { printf '%s' "/usr/local/bin/acme.sh"; return 0; }
+	TLS_CERT_FILE=""; TLS_KEY_FILE=""; CF_TOKEN="tok"
+	eq_case "降级②：有 acme.sh 且有 token 就选 acme" "acme" "$(resolve_cert_mode)"
+
+	# ③ 没文件、没 token（哪怕有 acme.sh）→ caddy（没有凭据申请不了 DNS-01）
+	CF_TOKEN=""
+	eq_case "降级③：没有 Cloudflare token 就退回 caddy" "caddy" "$(resolve_cert_mode)"
+
+	# ④ 没文件、有 token、但没有 acme.sh → caddy
+	eval "$_orig_detect_acme"
+	detect_acme_sh() { return 1; }
+	CF_TOKEN="tok"
+	eq_case "降级④：有 token 但没 acme.sh 仍退回 caddy" "caddy" "$(resolve_cert_mode)"
+	eval "$_orig_detect_acme"
+
+	TLS_CERT_FILE="${sv_cert}"; TLS_KEY_FILE="${sv_key}"; CF_TOKEN="${sv_tok}"
+
+	# decide_cert_mode：显式 --cert-mode 是硬覆盖
+	local sv_mode="${CERT_MODE}" sv_actual="${CERT_MODE_ACTUAL}" sv_tok2="${CF_TOKEN}"
+	CERT_MODE="caddy"; CF_TOKEN=""; CERT_MODE_ACTUAL=""
+	true_case "显式 caddy 模式被直接采纳" decide_cert_mode
+	eq_case "显式 caddy 覆盖了自动判断" "caddy" "${CERT_MODE_ACTUAL}"
+	CERT_MODE="acme"; CF_TOKEN=""
+	false_case "显式 acme 但没 token 被拒" decide_cert_mode
+	CERT_MODE="${sv_mode}"; CERT_MODE_ACTUAL="${sv_actual}"; CF_TOKEN="${sv_tok2}"
+
+	# ---- 18b) Cloudflare token 只从文件/环境变量来 ----
+	true_case "token 载入函数已定义" command -v load_cf_token
+	local tdir_tok="" saved_tokfile="${CF_TOKEN_FILE}" saved_tok="${CF_TOKEN}" saved_envtok="${CF_Token:-}"
+	tdir_tok=$(mktemp -d)
+	unset CF_Token
+	CF_TOKEN_FILE="${tdir_tok}/t"; CF_TOKEN=""
+	printf 'AbC123_-xyz\n' > "${tdir_tok}/t"
+	true_case "从文件读 token 成功" load_cf_token
+	eq_case "token 内容正确" "AbC123_-xyz" "${CF_TOKEN}"
+	# 换行/回车/空白都要被剥掉：token 里本来就不该有这些
+	printf '  AbC123_-xyz  \r\n' > "${tdir_tok}/t"; CF_TOKEN=""
+	load_cf_token
+	eq_case "token 首尾空白与回车被剥掉" "AbC123_-xyz" "${CF_TOKEN}"
+	# 含非法字符（如空格、等号、引号）必须拒绝 —— 它是从文件流向子进程环境的
+	printf 'abc def\n' > "${tdir_tok}/t"; CF_TOKEN=""
+	false_case "含空格的 token 被拒" load_cf_token
+	printf 'export CF_Token=abc\n' > "${tdir_tok}/t"; CF_TOKEN=""
+	false_case "带 export 前缀的 token 被拒" load_cf_token
+	# 环境变量优先于文件
+	printf 'fromfile\n' > "${tdir_tok}/t"
+	CF_TOKEN_FILE="${tdir_tok}/t"; CF_TOKEN=""
+	CF_Token="fromenv"
+	load_cf_token
+	eq_case "环境变量优先于文件" "fromenv" "${CF_TOKEN}"
+	unset CF_Token
+	CF_TOKEN_FILE="${saved_tokfile}"; CF_TOKEN="${saved_tok}"
+	if [ -n "${saved_envtok}" ]; then CF_Token="${saved_envtok}"; fi
+	rm -rf "${tdir_tok}"
+
+	# 关键边界：命令行不能有 --cf-token（会进 shell 历史）。
+	# 否则用户会以为「能直接传」，然后 token 留在 ~/.bash_history 里。
+	# 认「选项列表里的 --cf-token」（行首两空格开始）—— 正文里提到它是正当的。
+	false_case "帮助的选项列表里没有 --cf-token" has "$(bash "$0" --help)" '^  --cf-token '
+	false_case "参数解析里没有 --cf-token" has "$(fn_body parse_args)" '\-\-cf-token\)'
+	true_case "帮助里收录 --cf-token-file" has "$(bash "$0" --help)" 'cf-token-file'
+	true_case "帮助里说明为何不直接传值" has "$(bash "$0" --help)" 'shell 历史'
+
+	# ---- 18c) 续期：reload 脚本与 systemd timer ----
+	true_case "reload 脚本渲染器已定义" command -v render_acme_reload_script
+	true_case "timer 渲染器已定义" command -v render_acme_renew_timer
+	true_case "renew service 渲染器已定义" command -v render_acme_renew_service
+
+	local rl="" svc="" tmr=""
+	rl=$(render_acme_reload_script)
+	svc=$(render_acme_renew_service)
+	tmr=$(render_acme_renew_timer)
+
+	# 事实 1 的固化：必须用 caddy reload --force，不能只 systemctl reload。
+	# 剥掉注释行再断言 —— 注释里正当地解释了「为什么不用 systemctl reload」。
+	local rl_code=""
+	rl_code=$(printf '%s' "$rl" | grep -v '^[[:space:]]*#' || true)
+	true_case "续期脚本用 caddy reload --force" has "$rl_code" 'reload --force'
+	# 绝不能有 `systemctl reload caddy || ...` —— 它退出码是 0，兜底永不执行
+	false_case "续期脚本没有 systemctl reload 兜底（会静默失效）" has "$rl_code" 'systemctl reload caddy'
+	true_case "续期脚本有 restart 兜底" has "$rl_code" 'systemctl restart caddy'
+	# 首次安装：--install-cert 会在阶段 4（Caddyfile 还没写）就调这个脚本一次。
+	# 那时没有东西可重载，必须成功退出 —— 否则 acme.sh 判 installcert 失败，
+	# 整个阶段 4 挂掉，而证书其实已经装好了。
+	# 模式里的 $ 和 { } 都是 grep -E 的元字符，必须转义，否则永远匹配不上（假绿）。
+	true_case "配置不存在时跳过 reload（首次安装）" has "$rl_code" '! -f "\$\{CONF_FILE\}"'
+	true_case "服务未运行时跳过 reload" has "$rl_code" 'is-active --quiet caddy'
+	# 权限收敛：真机上验证过的 750/644/640 布局
+	true_case "目录权限 750" has "$rl_code" 'chmod 0750'
+	true_case "全链 644" has "$rl_code" 'chmod 0644'
+	true_case "私钥 640" has "$rl_code" 'chmod 0640'
+	true_case "属主收敛为 root:caddy" has "$rl_code" 'chown root:caddy'
+	# 判据是 caddy 用户能否真读到，不是权限位看着对
+	true_case "用 runuser 实测 caddy 可读" has "$rl_code" 'runuser -u caddy'
+
+	# timer：每天 + 随机延迟 + 补跑（与真机上验证过的 unit 对齐）
+	true_case "timer 用 OnCalendar=daily" has "$tmr" '^OnCalendar=daily$'
+	true_case "timer 有随机延迟" has "$tmr" 'RandomizedDelaySec=3600'
+	true_case "timer 开机补跑" has "$tmr" '^Persistent=true$'
+	true_case "timer 挂到 timers.target" has "$tmr" 'WantedBy=timers.target'
+	# service：oneshot + 跑 acme.sh --cron
+	true_case "renew service 是 oneshot" has "$svc" '^Type=oneshot$'
+	true_case "renew service 调 acme.sh --cron" has "$svc" '\-\-cron'
+	# 注意：grep -E 会把模式开头的 -- 当成选项结束符，所以这里用空格前缀而不是 \-\-。
+	true_case "renew service 带上 --home" has "$svc" ' --home '
+	# 生成的脚本必须是合法 bash（与主脚本同样对待）
+	# 写进临时文件再 bash -n，验证渲染产物本身能过语法检查
+	local rlf=""
+	rlf=$(mktemp)
+	printf '%s\n' "$rl" > "$rlf"
+	true_case "渲染出的 reload 脚本通过 bash -n" bash -n "$rlf"
+	rm -f "$rlf"
+
+	# ---- 18d) 调用点贯通：不装续期就没有自动续期 ----
+	true_case "acme 模式才装续期" has "$(fn_body install_service)" 'CERT_MODE_ACTUAL'
+	# 体检预览必须与实际渲染一致：acme 模式下预览也要把 tls 指到统一落点，
+	# 否则用户看到的 `tls <邮箱>` 和真正写进去的证书路径对不上（预览在说谎）。
+	true_case "体检预览在 acme 模式下指到统一落点" has "$(fn_code do_check)" 'CERT_FILE'
+	true_case "install_service 调用 install_renewal" has "$(fn_body install_service)" 'install_renewal'
+	true_case "OpenRC 无 cron 时明确警告" has "$(fn_body install_renewal)" '无法自动续期'
+	true_case "OpenRC 有 cron 时才装 cron 任务" has "$(fn_body install_renewal)" 'crontab'
+	# 没有可靠定时机制时不能假装成功：RENEW_METHOD 必须落到 none，
+	# 摘要才会照实说「未开启自动续期」，而不是打绿勾。
+	true_case "无定时机制时标记为 none" has "$(fn_code install_renewal)" 'RENEW_METHOD="none"'
+	true_case "有 systemd 时标记为 systemd" has "$(fn_code install_renewal)" 'RENEW_METHOD="systemd"'
+	# 行为级：OpenRC + 无 cron 必须真的警告且不改用假成功
+	true_case "OpenRC 无 cron 时不谎报续期已开" no_fake_renewal_on_openrc
+	# acme 模式的申请与落点
+	true_case "申请函数已定义" command -v issue_cert_with_acme
+	# ECDSA 证书必须带 --ecc，否则找不到 <域名>_ecc 目录（真机踩过）。
+	# 用剥掉注释的 fn_code：否则注释里那句「--ecc 必须带」会让断言假绿。
+	true_case "install-cert 带 --ecc" has "$(fn_code issue_cert_with_acme)" '\-\-ecc'
+	# --issue 跳过时返回 2，不能当成失败
+	true_case "issue 的退出码 2 当跳过处理" has "$(fn_code issue_cert_with_acme)" 'rc.*-ne 2'
+	true_case "DNS-01 走 dns_cf" has "$(fn_code issue_cert_with_acme)" 'dns_cf'
+	true_case "staging 用 letsencrypt_test" has "$(fn_code issue_cert_with_acme)" 'letsencrypt_test'
+	# 装完立刻切 CA —— 不切会静默用 ZeroSSL（源码 DEFAULT_CA=$CA_ZEROSSL）
+	true_case "切默认 CA 的函数已定义" command -v set_acme_default_ca
+	true_case "切 CA 用 --set-default-ca" has "$(fn_body set_acme_default_ca)" 'set-default-ca'
+	true_case "切 CA 指到 letsencrypt" has "$(fn_body set_acme_default_ca)" 'server letsencrypt'
+	true_case "acme_prepare 会调用切 CA" has "$(fn_body acme_prepare)" 'set_acme_default_ca'
+	# 无 cron 时必须 --force（官方安装器否则拒绝安装）
+	true_case "无 cron 时安装器加 --force" has "$(fn_body install_acme_sh)" 'force="--force"'
+	true_case "安装前检查是否有 cron" has "$(fn_body install_acme_sh)" 'need_cmd crontab'
+	# 许可证边界：绝不 vendor acme.sh 源码
+	true_case "从官方地址拉安装器（不 vendor）" has "$(fn_body install_acme_sh)" 'get.acme.sh'
+	# 注意：这里刻意不用 has "$(cat "$0")" —— 本文件 180KB，管道喂给提前退出的
+	# grep 会让 printf 吃到 SIGPIPE，pipefail 下成功的匹配也会变成退出码 141。
+	# 改判「源码里有没有把 acme.sh 的实现搬进来」的标志性函数名。
+	true_case "仓库里没有内嵌 acme.sh 的实现" no_vendored_acme
+	true_case "帮助里点明 GPL/MIT 边界" has "$(bash "$0" --help)" 'GPL'
+
+	# ---- 18e) 证书落点统一 ----
+	true_case "证书目录常量存在" has "$(grep -m1 '^CERT_DIR=' "$0")" '/etc/ssl/naiveproxy'
+	true_case "全链落点常量" has "$(grep -m1 '^CERT_FILE=' "$0")" 'fullchain[.]pem'
+	true_case "私钥落点常量" has "$(grep -m1 '^CERT_KEY_FILE=' "$0")" 'privkey[.]pem'
+	true_case "布局收敛函数已定义" command -v normalize_cert_layout
+	true_case "收敛函数设目录 750" has "$(fn_body normalize_cert_layout)" 'chmod 0750'
+	true_case "收敛函数设私钥 640" has "$(fn_body normalize_cert_layout)" 'chmod 0640'
+	true_case "收敛函数设全链 644" has "$(fn_body normalize_cert_layout)" 'chmod 0644'
+	# ensure_cert_readable 要认得我们自己的目录，走确定布局而非 o+rx 兜底
+	true_case "ensure_cert_readable 认得统一落点" has "$(fn_body ensure_cert_readable)" 'normalize_cert_layout'
+
+	# ---- 18f) 验证阶段：证书判据必须来自握手（事实 1 的教训）----
+	# 用 fn_code：注释里提到 s_client 不算数，必须是代码里真的连了握手。
+	# 证伪实测：把这一行换成读盘上的文件、注释不动时，只有 fn_code 能把变红。
+	true_case "验证用 openssl s_client 读握手" has "$(fn_code verify_deployment)" 's_client'
+	true_case "s_client 连的是本机端口（不是读文件）" has "$(fn_code verify_deployment)" 'connect "127[.]0[.]0[.]1'
+	true_case "验证报告签发者" has "$(fn_code verify_deployment)" 'issuer'
+	true_case "验证报告到期时间" has "$(fn_code verify_deployment)" 'enddate'
+	true_case "验证报告 DNS 名" has "$(fn_code verify_deployment)" 'subject'
+
+	# ---- 18g) 状态文件贯通（新键往返 + 再校验） ----
+	true_case "状态写入保存证书模式" has "$(fn_body state_write)" 'STATE_CERT_MODE'
+	true_case "状态读取解析证书模式" has "$(fn_body state_parse_into_vars)" 'STATE_CERT_MODE'
+	true_case "状态再校验覆盖证书模式" has "$(fn_body state_revalidate)" 'STATE_CERT_MODE'
+	local saved_state3="${STATE_FILE}" tdir3=""
+	tdir3=$(mktemp -d)
+	STATE_FILE="${tdir3}/state"
+	DOMAIN="a.example.com"; EMAIL="o@m.test"; NAIVE_USER="tom"
+	NAIVE_PASS="Aa12345678"; HTTPS_PORT="443"; ALLOW_PORTS=""
+	PROBE_SECRET=""; PAC_PATH=""; CLIENT_PROTO="https"
+	TLS_CERT_FILE="${CERT_FILE}"; TLS_KEY_FILE="${CERT_KEY_FILE}"
+	CERT_MODE_ACTUAL="acme"
+	state_write
+	DOMAIN=""; EMAIL=""; NAIVE_USER=""; NAIVE_PASS=""; HTTPS_PORT=""
+	CERT_MODE_ACTUAL=""
+	state_parse_into_vars
+	eq_case "往返：证书模式" "acme" "${STATE_CERT_MODE}"
+	true_case "往返后仍通过再校验" state_revalidate
+	# 被改坏的证书模式必须在再校验时被拦下
+	printf 'STATE_DOMAIN=a.example.com\nSTATE_USER=tom\nSTATE_PASS=Aa12345678\nSTATE_PORT=443\nSTATE_CERT_MODE=bogus\n' > "${STATE_FILE}"
+	state_parse_into_vars
+	false_case "状态文件里的非法证书模式被拦下" state_revalidate
+	rm -rf "${tdir3}"
+	STATE_FILE="${saved_state3}"
+
+	# ---- 18h) 行为级：真实命令行 ----
+	false_case "体检拒绝非法 cert-mode" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode bogus
+	false_case "体检拒绝 --cert-mode file 却无文件" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode file
+	false_case "体检拒绝 --cert-mode acme 却无 token" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode acme
+	false_case "体检拒绝不存在的 token 文件" bash "$0" --check --domain a.example.com --email o@m.test --cf-token-file /nonexistent/cf
+	true_case "体检接受 auto 模式（无 token 时退 caddy）" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto
+	true_case "体检默认就是 auto" bash "$0" --check --domain a.example.com --email o@m.test
+	true_case "--acme-staging 被接受" bash "$0" --check --domain a.example.com --email o@m.test --acme-staging
+	# --cert-mode= 等号形式（与 --tls-cert= 同源的一致性要求）
+	false_case "cert-mode= 等号形式同样生效" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode=bogus
+
+	fi
+	# ---- 19) 子集自检自身的收尾（SC2295 / 区域索引 / 过滤行为）----
+	# 这一节单独成节，不混进上面任何既有区段：既有 385 条一行没动，这里纯新增。
+	if st_want 19; then
+	printf '\n[19] 子集自检收尾（SC2295 / 区域索引 / 过滤行为）\n'
+
+	# ---- 19a) SC2295：${st_def#…} 的展开式必须单独加引号 ----
+	# 裸写 ${st_def#${st_fn}} 时 st_fn 会被当 glob 模式匹配。当下值恰好是纯字面量
+	# 所以没出错，但一旦有特殊字符（* ? [）就会静默截错，包装器被定义成残体，
+	# 表现为「断言静默变成空断言」。用 fn_code 断，注释里写到的样子不算数。
+	true_case "去前缀展开式的变量带引号（SC2295）" \
+		has "$(fn_code self_test)" '\$\{st_def#"\$\{st_fn\}"\}'
+	true_case "不再出现未加引号的去前缀展开式" \
+		not_has "$(fn_code self_test)" '\$\{st_def#\$\{st_fn\}\}'
+
+	# ---- 19b) 区段索引：存在、覆盖全部区段标题、且不写死行号 ----
+	true_case "文件头有区域索引" has "$(head -80 "$0")" '区域索引'
+	true_case "索引列齐了全部区段标题" index_lists_all_sections
+	false_case "索引里不写死精确行号" index_has_line_numbers
+
+	# ---- 19c) 过滤行为：命中要跑、零命中要报错 ----
+	# 这两条是真行为级：起真子进程跑 --self-test，看它的退出码与输出。
+	# 注意这里刻意只跑小模式（「密码生成」子集 < 1 秒）；绝不能对全量断言起子进程 ——
+	# 那等于在自检里再嵌一轮 78 秒自检，会成倍放大进程生灭。
+	true_case "子集命中关键词时正常跑并退出 0" self_test_subset_hits
+	true_case "子集零命中时退出非 0 且给出提示" self_test_subset_missing_errors
+	# 过滤「静默失效」（最危险的一种坏法）：报数行照旧漂亮，实际却跑满全量。
+	# 只数真跑出来的 PASS，不看报数行，才逮得住。
+	true_case "子集只跑命中的断言、不多跑" self_test_subset_isolates_sections
+
+	fi
+# ST_ASSERT_END
+	if self_test_report "$pass" "$fail" "$skip" "$((st_total - st_kept))"; then
+		return 0
+	fi
+	return 1
 }
 
 main "$@"

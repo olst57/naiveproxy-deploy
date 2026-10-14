@@ -10,6 +10,69 @@ v2.2.0 / v2.1.0 两条是本次建仓时回填的历史记录（当时未打 tag
 
 （暂无）
 
+## [2.5.0] - 2026-10-14
+
+### 新增：acme.sh 证书路径（第四轮）
+
+用户要求：「先检查机器是否有 acme.sh，没有就要装上去。然后申请证书，定时续期。」
+此前只有三条路（`--tls-cert` 指定文件 / 给邮箱让 caddy 自签 / `tls internal`），**缺 acme.sh**。
+
+自检 289 → **385** 条。核心事实全部来自真机实测，写进代码注释以防被改回去。
+
+**证书模式自动选择（三层降级，`--cert-mode auto` 默认）**
+
+1. 显式 `--tls-cert`/`--tls-key` → 用文件（行为与 2.4.0 一致，零 ACME 额度消耗）
+2. 机器上有 acme.sh **且**给了 Cloudflare 凭据 → acme.sh 申请 + systemd timer 续期
+3. 都没有 → 交给 Caddy 自己申请（给邮箱时）
+
+`--cert-mode acme|caddy|file` 可强制指定。自动判断逻辑抽成 `resolve_cert_mode()`，
+部署与 `--check` 共用同一份 —— 避免「体检打绿勾、部署才炸」的覆盖漂移。
+
+**几个必须守住的坑（都写了注释说明为什么）**
+
+| # | 坑 | 后果 | 做法 |
+| --- | --- | --- | --- |
+| 1 | `systemctl reload caddy` 换不掉证书（真机实测：返回成功、握手仍旧证书） | 续期「成功」但一直用旧证书，到期那天才发现 | 续期钩子用 `caddy reload --force`；**绝不**写 `systemctl reload \|\| caddy reload`（前者退出码 0，兜底永不执行） |
+| 2 | 这台机器没有 cron | acme.sh 官方安装器拒绝安装；它自带的 cron 续期不会跑 | 无 cron 时安装器加 `--force`；续期用 **systemd timer** |
+| 3 | acme.sh 默认 CA 是 ZeroSSL（源码 `DEFAULT_CA=$CA_ZEROSSL`） | 静默签发 ZeroSSL 证书 | 装完立刻 `--set-default-ca --server letsencrypt` |
+| 4 | ECDSA 证书目录是 `<域名>_ecc` | 漏 `--ecc` 找不到证书 | `--install-cert` 与 `--issue` 都带 `--ecc` |
+| 5 | `acme.sh --issue` 在「未到续期窗口」时返回 **2**（`RENEW_SKIP`） | `\|\| return 1` 会把正常跳过误报成失败 | 显式把退出码 2 当「跳过」处理 |
+
+**其它**
+
+- Cloudflare token **只从文件（`--cf-token-file`）或环境变量（`CF_Token`）读**，不支持命令行直传 —— 那会进 shell 历史
+- 证书统一落 `/etc/ssl/naiveproxy/`：目录 `750 root:caddy`、`fullchain.pem`/`chain.pem` `644`、`privkey.pem` `640`
+- 验证阶段报告**握手里**读到的证书的 DNS 名 / 签发者 / 到期时间（判据是 `openssl s_client`，不是盘上文件 —— 正是坑 1 的教训）
+- 许可证边界：acme.sh 是 **GPL-3.0**、本仓库 **MIT**。只调用其 CLI，**不 vendor 源码**；自检有 `no_vendored_acme` 守着这条线
+- OpenRC（Alpine）环境退回 acme.sh 自带 `--install-cronjob`；**连 cron 都没有时明确警告无法自动续期**，不假装成功
+
+**一处只有写代码时才会碰到的坑（不在规格里）**
+
+acme.sh 的 `--install-cert` 会**立刻执行一次 `--reloadcmd`** —— 而那时（阶段 4）
+Caddyfile 还没写、caddy 服务还没装。续期脚本若此时报错退出，`installcert`
+判定失败，**整个阶段 4 会挂掉**，尽管证书其实已经装好了。
+`naive-cert-reload.sh` 因此对「配置还不存在」和「服务没在跑」两种情况**成功退出**，
+只在这两种情况之外才真的判失败。
+
+**证伪实验（10 个变异体，全部被断言抓红）**
+
+| 变异 | 被抓红的断言 |
+| --- | --- |
+| reload 改回 `systemctl reload caddy \|\| …` | 「续期脚本没有 systemctl reload 兜底」 |
+| `--install-cert` 去掉 `--ecc` | 「install-cert 带 --ecc」 |
+| `--issue` 退出码 2 当失败 | 「issue 的退出码 2 当跳过处理」 |
+| 去掉 `--set-default-ca` | 「切 CA 用 --set-default-ca」等 2 条 |
+| 私钥权限改 644 | 「收敛函数设私钥 640」 |
+| 验证改读盘上文件 | 「验证用 openssl s_client 读握手」等 2 条 |
+| auto 模式跳过 acme.sh 探测 | 「降级②：有 acme.sh 且有 token 就选 acme」 |
+| 安装器去掉 `--force` | 「无 cron 时安装器加 --force」 |
+| 去掉 token 字符集校验 | 「含空格的 token 被拒」等 2 条 |
+| OpenRC 无 cron 时不设 `RENEW_METHOD=none`（假成功） | 「OpenRC 无 cron 时不谎报续期已开」 |
+
+> 其中两条（`--ecc`、`s_client`）第一轮**没被抓到** —— 断言匹配到了注释里解释性的话，
+> 而不是真正的命令行。新增 `fn_code()`（剥注释取函数体）后才把这两条锁死。
+> 这正是「证伪实验」的价值：不做它，这两条断言就是假的。
+
 ## [2.4.0] - 2026-10-13
 
 ### 第三轮：独立审计修掉 6 个缺陷

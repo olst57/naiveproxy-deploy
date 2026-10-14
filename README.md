@@ -105,6 +105,7 @@ sudo ./deploy-naive-caddy.sh --uninstall --purge
 | `--serve-pac <路径>` | 生成 PAC 文件（Android Wi-Fi 代理由此接入）。开了 `probe_resistance` 时路径必须不可预测 |
 | `--client-proto <协议>` | 客户端配置用 `https` 还是 `quic`（默认 https） |
 | `--tls-cert <文件>` / `--tls-key <文件>` | 复用现成证书（certbot / acme.sh 签的），**不消耗 ACME 额度** |
+| `--cert-mode <方式>` | 证书怎么来：`auto`（默认）/ `acme` / `caddy` / `file`。见下方「证书从哪来」 |
 | `--allow-ports "<列表>"` | 限定客户端可经代理访问的目标端口，如 `"80 443"`。留空则不限制。加此项可防止凭据外泄后代理被当作任意端口跳板 |
 | `--force-config` | 配置已存在时也重新生成（自动备份原件） |
 | `--build-from-source` | 用 xcaddy 从源码编译（非 x86_64 架构会自动启用） |
@@ -123,6 +124,58 @@ sudo ./deploy-naive-caddy.sh --uninstall --purge
 | `--uninstall [--purge]` | 卸载；`--purge` 连站点/日志/数据/用户一起删（会二次确认） |
 | `--self-test` | 开发者自检：不需要 root，**运行后自报断言数量** |
 
+### 证书从哪来（`--cert-mode`）
+
+`auto`（默认）按三层降级挑一条路，**不会改变已有命令行的行为**：
+
+1. 给了 `--tls-cert`/`--tls-key` → 直接用你的文件（零 ACME 额度消耗，与旧版一致）
+2. 机器上有 [acme.sh](https://github.com/acmesh-official/acme.sh) 且给了 Cloudflare 凭据 → 用 acme.sh 申请 + 装 **systemd timer** 自动续期
+3. 都没有 → 交给 Caddy 自己向 Let's Encrypt 申请（给邮箱时）
+
+用 `--cert-mode acme|caddy|file` 可以强制指定某一条。
+
+#### acme.sh 这条路
+
+| 参数 | 说明 |
+| --- | --- |
+| `--cf-token-file <文件>` | Cloudflare API token 的文件路径（`Zone → DNS → Edit` 权限）。**文件里只放 token 一行** |
+| `--acme-email <邮箱>` | acme.sh 的通知邮箱，默认沿用 `--email` |
+| `--acme-staging` | 用 Let's Encrypt 测试环境，**不消耗生产额度**（调试用） |
+
+没有 acme.sh 时脚本会自动装（**无 cron 的机器加 `--force`**，因为官方安装器否则拒绝安装），
+装完**立刻把默认 CA 切成 Let's Encrypt** —— acme.sh 默认指向 ZeroSSL，不切会静默用错 CA。
+校验走 **DNS-01 + Cloudflare**，所以 **80 端口不必对外可达**。
+
+**Token 只从文件或环境变量读，不支持命令行直传**（会进 shell 历史）：
+
+```bash
+# 方式一：文件
+printf '%s\n' '你的CF_Token' | sudo tee /root/.cf-token >/dev/null
+sudo chmod 600 /root/.cf-token
+sudo ./deploy-naive-caddy.sh --domain proxy.example.com --email ops@mail.test --cf-token-file /root/.cf-token
+
+# 方式二：环境变量
+sudo CF_Token='你的CF_Token' -E ./deploy-naive-caddy.sh --domain proxy.example.com --email ops@mail.test
+```
+
+证书统一落在 `/etc/ssl/naiveproxy/`（目录 `750 root:caddy`、`fullchain.pem`/`chain.pem` `644`、`privkey.pem` `640`）。
+
+> **续期用 systemd timer，不用 cron。** 真机实测这台机器没有 cron（`crontab` 缺失、`cron` 服务 inactive），
+> acme.sh 官方安装器会因此拒绝安装，且它自带的 cron 续期在这个环境下不会跑。OpenRC（Alpine）
+> 环境没有 systemd，会退回 acme.sh 自带的 `--install-cronjob`；**连 cron 都没有时会明确警告无法自动续期**，
+> 不会假装成功。
+
+> **`systemctl reload caddy` 换不掉证书。** 真机实测：它返回成功，但 TLS 握手读到的仍是旧证书 ——
+> 静默失效，直到证书到期那天才发现。续期钩子 `naive-cert-reload.sh` 因此必须用
+> `caddy reload --force --config /etc/caddy/Caddyfile`。也**绝不能**写成
+> `systemctl reload caddy || caddy reload --force`：前者退出码是 0，兜底永远不会执行。
+
+#### 许可证边界
+
+acme.sh 是 **GPL-3.0**，本仓库是 **MIT**。GPL 限制的是**分发**而非**使用**：
+脚本只**调用** acme.sh 的 CLI（边界使用，不是衍生作品），从官方地址 `https://get.acme.sh`
+现场获取安装器，**绝不把它的源码 vendor / 复制进本仓库** —— 那会迫使整个仓库变成 GPL-3.0。
+
 ## 部署流程（7 个阶段）
 
 | # | 阶段 | 做什么 |
@@ -133,8 +186,8 @@ sudo ./deploy-naive-caddy.sh --uninstall --purge
 | 3 | 创建运行用户与目录 | 独立 `caddy` 系统用户（nologin），收紧日志与数据目录权限 |
 | 4 | 写入 Caddyfile | 渲染 → 仅在排版需要时 `caddy fmt`（会先备份）→ `caddy validate` |
 | 5 | 布置伪装站点 | 生成 `/var/www/naive-camouflage/index.html`（刻意不用 `/var/www/html`） |
-| 6 | 安装并启动服务 | systemd unit（或 Alpine 的 openrc 脚本）并启动 |
-| 7 | 验证部署 | 4 项实测：本机 HTTPS 握手、证书签发者、代理转发实测、公网可达 |
+| 6 | 安装并启动服务 | systemd unit（或 Alpine 的 openrc 脚本）并启动；acme 模式下顺带装续期 timer |
+| 7 | 验证部署 | 4 项实测：本机 HTTPS 握手、证书签发者/到期时间/**从握手读到的证书**、代理转发实测、公网可达 |
 
 阶段编号由 `STAGE_NAMES` 数组统一推导，标题与失败提示用同一个名字 —— 不会出现「屏幕上写着第 4 步、报错说第 5 步」。
 
