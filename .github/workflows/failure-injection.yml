@@ -13,6 +13,14 @@
 name: Failure Injection Matrix
 
 on:
+  # push 触发是必要的：workflow_dispatch 要求 workflow 已存在于【默认分支】，
+  # 放到侧分支上时 GitHub 不会登记它（gh workflow run 会返回 404）。
+  # 加 push 后，推到 ci/failmatrix 分支即可自动运行。
+  push:
+    branches: [ci/failmatrix, main]
+    paths:
+      - '.github/workflows/failure-injection.yml'
+      - '.github/fixtures/failmatrix/**'
   workflow_dispatch:
     inputs:
       stages:
