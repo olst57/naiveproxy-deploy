@@ -336,3 +336,6 @@ sudo ./deploy-naive-caddy.sh --collect-diagnostics  # 出问题时收集信息
 
 > 一句话概括验证状态：主路径已在真机（Debian 13）端到端跑通并留证；
 > Alpine/openrc、arm64 源码编译、失败注入矩阵**尚未覆盖**。详见 `docs/VERIFICATION.md`。
+>
+> Alpine/openrc 已有 CI 作业（`.github/workflows/alpine-openrc.yml`，真 `alpine:3.20` 容器），
+> 但**跑出结果之前不算验证** —— CI 文件存在 ≠ 已验证。

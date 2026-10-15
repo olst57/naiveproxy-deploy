@@ -1,0 +1,101 @@
+# Alpine / OpenRC 真机 CI
+#
+# 为什么单开一条：主 CI（ci.yml）跑在 ubuntu-latest 上 —— 那里没有 musl、
+# 没有 busybox、没有 openrc。脚本的 openrc 分支（render_openrc_script、
+# rc-service 调用、apk 包名映射、adduser/addgroup 分支）此前只有静态断言覆盖，
+# 从未在真 Alpine 用户态里执行过。
+#
+# 边界（别误读为部署保证）：
+#   本 workflow 只验证「脚本在真 Alpine 里跑得动」。它【不】起 caddy、
+#   【不】签证书、【不】连任何服务器、【不】验证代理可用性。
+
+name: Alpine / OpenRC
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alpine-openrc:
+    name: Alpine 3.20 真机自检
+    runs-on: ubuntu-latest
+    # 必须是 x64：JS 动作（actions/checkout）在 Alpine 容器里只有 x64 被 runner 支持
+    # （arm64 会直接报 "JavaScript Actions in Alpine containers are only supported on x64"）。
+    container: alpine:3.20
+    # 止损：单次超过 15 分钟无结果即视为卡住（见任务止损条款）
+    timeout-minutes: 15
+    steps:
+      # actions/checkout 是 JS 动作，它调用的 git 必须在容器里存在 —— Alpine 基础镜像不带 git。
+      - name: 0. 装依赖（规格清单）
+        run: apk add --no-cache bash curl tar xz shellcheck openrc git
+
+      # 规格清单之外，单独一步并说明理由：脚本自检里有 5 条断言依赖这两个工具，
+      # 不装它们会变成 SKIP（openssl 4 条 + python 1 条），Alpine 覆盖就出现空洞。
+      # 装在单独一步是为了让「规格清单」与「为补覆盖而加的东西」在日志里可分辨。
+      - name: 0b. 补装可选工具（让依赖 openssl/python 的断言真跑，而不是 SKIP）
+        run: apk add --no-cache openssl python3
+
+      - name: 1. 取出仓库
+        uses: actions/checkout@v4
+
+      - name: 2. 环境自述（排查用）
+        run: |
+          echo "alpine-release: $(cat /etc/alpine-release)"
+          echo "arch:           $(uname -m)"
+          echo "shell:          $(readlink -f /bin/sh)"
+          bash --version | head -n1
+          shellcheck --version | head -n2 || true
+          ls -l /sbin/rc-service || echo "(无 rc-service)"
+          echo "uid: $(id -u)"
+
+      - name: 3. 语法检查 bash -n
+        run: |
+          for f in deploy-naive-caddy.sh validate-caddyfile.sh; do
+            bash -n "$f"
+            echo "OK  bash -n $f"
+          done
+
+      # 信息性，不设门禁：Alpine 3.20 自带的 shellcheck 版本与主 CI 锁定的 0.11.0 不同，
+      # 版本漂移会引入新规则（如 SC2329），失败可能只是版本差异而非真问题。
+      # 主 CI 的 0.11.0 才是事实源；这里的结果仅作参考，但仍如实打印。
+      - name: 4. shellcheck（信息性：版本与主 CI 锁定的 0.11.0 不同）
+        continue-on-error: true
+        run: |
+          shellcheck --version | head -n 2
+          shellcheck -x -S style deploy-naive-caddy.sh validate-caddyfile.sh
+          echo "OK  shellcheck: 0 warnings"
+
+      - name: 5. 离线自检 --self-test（核心门禁）
+        run: |
+          bash deploy-naive-caddy.sh --self-test
+
+      # 规格第 3 项：验证 render_openrc_script() 的产出真的可用。
+      # 取法与脚本自身 renderers_silent()（deploy-naive-caddy.sh:3335）完全一致 ——
+      # 只删掉末尾那一行 main "$@"，其余原样 source。不复制、不改动脚本任何内容。
+      - name: 6. render_openrc_script 产出可用（sh -n + reload()）
+        run: |
+          set -eu
+          lib="$(mktemp)"
+          grep -vxF 'main "$@"' deploy-naive-caddy.sh > "$lib"
+          bash -c '. "$1"; render_openrc_script' _ "$lib" > /tmp/caddy.openrc
+          rm -f "$lib"
+
+          echo "===== 渲染产物 ====="
+          cat /tmp/caddy.openrc
+          echo "===================="
+
+          test -s /tmp/caddy.openrc
+          echo "OK  渲染产物非空（$(wc -l < /tmp/caddy.openrc) 行）"
+
+          sh -n /tmp/caddy.openrc
+          echo "OK  sh -n 通过（解释器 /bin/sh -> $(readlink -f /bin/sh)）"
+
+          grep -qE '^reload\(\) \{' /tmp/caddy.openrc
+          echo "OK  产出里有 reload()（脚本 1327 行注释：不定义它 --reload 在 Alpine 上必然失败）"
+
+          grep -qE '^#!/sbin/openrc-run' /tmp/caddy.openrc
+          echo "OK  shebang 是 /sbin/openrc-run"
