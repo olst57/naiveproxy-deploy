@@ -120,14 +120,26 @@ jobs:
           echo "── ./caddy version ──"
           ./caddy version
 
-          echo "── ./caddy list-modules | grep -i forwardproxy ──"
-          mods="$(./caddy list-modules | grep -i forwardproxy || true)"
+          # 正确的模块名是 http.handlers.forward_proxy（下划线）。
+          # 别 grep "forwardproxy"（无下划线）——那是仓库名，不是模块名，
+          # 会永远匹配不到、把成功的构建误判成失败。
+          # 旁证：生产机上已验证可用的 caddy 里，模块名就是 http.handlers.forward_proxy。
+          echo "── ./caddy list-modules | grep -i forward_proxy ──"
+          mods="$(./caddy list-modules | grep -i 'forward_proxy' || true)"
           echo "$mods"
           if [ -z "$mods" ]; then
-            echo "FAIL list-modules 里找不到 forwardproxy —— 构建出来的不是 naive 版本"
+            echo "FAIL list-modules 里找不到 forward_proxy —— 构建出来的不是 naive 版本"
+            echo "     全部模块名（排查用）:"
+            ./caddy list-modules | grep -i proxy || true
             exit 1
           fi
-          echo "OK  forward_proxy 模块存在"
+          # 断言的是确切名字，不是"含 forward_proxy 的任意行"——
+          # 否则 http.reverse_proxy.* 之类的行会让断言变得毫无约束力。
+          if ! echo "$mods" | grep -qx 'http.handlers.forward_proxy'; then
+            echo "FAIL 模块名不是 http.handlers.forward_proxy，实际是: $mods"
+            exit 1
+          fi
+          echo "OK  http.handlers.forward_proxy 模块存在（确切名字已核对）"
 
       - name: 9. caddy validate（含 forward_proxy 的最小 Caddyfile）
         working-directory: ${{ runner.temp }}/build
