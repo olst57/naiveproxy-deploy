@@ -21,7 +21,8 @@
 #   sudo ./deploy-naive-caddy.sh --uninstall --purge      彻底卸载
 #   ./deploy-naive-caddy.sh --self-test                   开发者自检（无需 root）
 #
-# 退出码: 0 成功 / 主动取消 | 1 校验或部署失败
+# 退出码: 0 成功 / 主动取消 / 显式 --skip-verify | 1 校验或部署失败
+#         | 2 部署完成但有验证项未确认（详见 --help）
 #
 # ================ 区域索引（按文件顺序；行号会漂所以不写行号）================
 # 下面每条顶格（列首）的 `# ---------------- 标题 ----------------` 就是一个区段。
@@ -63,13 +64,14 @@
 #     ～ 参数解析
 #     ～ 主流程
 #     ～ 自检用的顶层辅助
+#     ～ 退出码 2 的行为级断言辅助
 #     ～ 开发者自检
 #     ～ 子集过滤（--self-test <模式>）
 # ST_INDEX_END
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.6.0"
 CADDY_FALLBACK_TAG="v2.11.7-naive"
 GH_REPO="klzgrad/forwardproxy"
 CADDY_BIN="/usr/bin/caddy"
@@ -436,7 +438,7 @@ run_stage() { # <序号> <函数...>
 # ---------------- 帮助与引导 ----------------
 usage() {
 	cat <<'USAGE'
-NaiveProxy 服务端部署脚本 v2.5.0
+NaiveProxy 服务端部署脚本 v2.6.0
 把这台服务器变成一台 NaiveProxy 服务端（Caddy + 伪装站点）。
 
 第一次用？按这个顺序走：
@@ -514,9 +516,20 @@ NaiveProxy 服务端部署脚本 v2.5.0
                          在那里操作会连带影响别人的站点
   --force-config         配置已存在时也重新生成（自动备份原件）
   --build-from-source    用 xcaddy 从源码编译（非 x86_64 架构会自动启用）
-  --skip-verify          跳过部署后的连通性验证
+  --skip-verify          跳过部署后的连通性验证。退出码仍记 0
+                         （跳过 = 没测，不是测出问题）—— 但摘要会明确写「未确认」
   --ascii                用纯 ASCII 标记输出（老终端 / GBK 编码下更稳）
   --dry-run              --check 的旧名字，保留兼容
+
+退出码：
+  0  成功；按回车主动取消；或显式用了 --skip-verify
+  1  失败 —— 参数不合法、环境不满足、或部署中某个阶段没通过。
+     这时摘要不会打印，密码和客户端配置也不会生成。
+  2  部署已经完成 —— 密码与 client-config.json 都照常打印，
+     只是阶段 7 的验证里有几项没能当场确认（本机 HTTPS 握手 / 证书信息 /
+     代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，
+     过几十秒重跑同一条命令复查即可；全过之后退出码就是 0。
+     脚本退出码 2【不是】「参数写错了」—— 那种情况是 1，参数解析在部署之前。
 
 运维：
   --upgrade              只升级 caddy 二进制，配置不动
@@ -2385,12 +2398,16 @@ print_summary() {
 	elif [ "${VERIFY_WARNINGS}" -eq 0 ]; then
 		printf '\n%s\n' "${C_GRN}${C_BLD}════════ ${G_OK} 部署完成，验证全部通过 ════════${C_RST}"
 	else
-		printf '\n%s\n' "${C_YEL}${C_BLD}════════ ${G_WARN} 部署完成，但有 ${VERIFY_WARNINGS} 项需要你确认 ════════${C_RST}"
+		# 横幅里写明「退出码 2」：脚本退出时进程码就是 2，不写的话人看见 2
+		# 会以为是「参数写错了」那一类错误，跑去改命令行 —— 而实际上部署已经完成、
+		# 密码和 config.json 上面都给了，只是有几项需要复查。
+		printf '\n%s\n' "${C_YEL}${C_BLD}════════ ${G_WARN} 部署完成，但有 ${VERIFY_WARNINGS} 项需要你确认（退出码 2）════════${C_RST}"
 		local n=""
 		for n in "${VERIFY_NOTES[@]}"; do
 			printf '%s\n' "  ${C_YEL}${G_WARN}${C_RST} ${n}"
 		done
 		printf '%s\n' "  ${C_DIM}这几项多半几十秒内会自己好（证书还在签发）。过一会儿重跑同一条命令即可复查。${C_RST}"
+		printf '%s\n' "  ${C_DIM}退出码 2 = 部署已完成（不是失败）；复查全过之后就会变成 0。${C_RST}"
 	fi
 
 	printf '\n%s\n' "  ${C_BLD}服务端${C_RST}"
@@ -3048,6 +3065,24 @@ main() {
 	run_stage 6 install_service
 	run_stage 7 verify_deployment
 	print_summary
+
+	# ---------------- 退出码：部署完成但验证未确认 ----------------
+	# 阶段 7 的 5 项检查里只有「服务 is-active」会 return 1（→ run_stage → exit 1）；
+	# 另外 4 项（本机 HTTPS 握手 / 证书信息 / 代理转发实测 / 公网可达）只经
+	# verify_warn() 累加计数器、不动退出码 —— 它们全失败时退出码仍是 0，于是
+	# `if sudo ./deploy.sh; then` 会走进「成功」分支。「部署完成」和「验证通过」
+	# 必须能靠退出码区分开，所以这里补一个 2：
+	#   0  全部通过；或用户显式 --skip-verify
+	#   1  致命失败（上面的 die / run_stage 路径，本段不动它）
+	#   2  没跳过验证，且有验证项没确认（VERIFY_WARNINGS > 0）
+	# 判定只能放这里（main 末尾、print_summary 之后）：放进 verify_deployment 里
+	# 用 exit/die 会经 run_stage(行 427-434) 直接 exit 1，跳过 print_summary ——
+	# 用户就拿不到密码和 client-config.json 了，比原来的 bug 更伤用户。
+	# --skip-verify 记 0：跳过是「没测」，不是「测出问题」，不该给非零。
+	if [ "$VERIFY_SKIPPED" = "no" ] && [ "$VERIFY_WARNINGS" -gt 0 ]; then
+		return 2
+	fi
+	return 0
 }
 
 # 区域索引的成员：从 ST_INDEX_BEGIN..ST_INDEX_END 里取出「 ～ 标题」列表，
@@ -3253,6 +3288,232 @@ stage_rc_propagates() {
 	printf '  期望失败信息里出现「退出码 7」。实际输出：
 %s
 ' "$out" >&2
+	return 1
+}
+
+# 阶段函数必须用 `err … ; return 1` 传递失败；用 die 会 exit 并绕开 fail_stage。
+# ---------------- 退出码 2 的行为级断言辅助 ----------------
+# 真起子进程跑一次 main，看它的退出码 —— 不是字符串匹配，也不看源码里写了什么。
+# 做法跟 stage_rc_propagates 同源：剥掉最后那行 `main "$@"` 再 source，
+# 于是 source 只定义函数不执行；再由调用方自己调 main，拿到真实退出码。
+#
+# 为什么要真跑：这一条要断的是「退出码」这个行为本身。源码里写了 `return 2`
+# 不等于它就真这么退出 —— 被后面的语句覆盖、或者判定条件写反，
+# 字符串匹配一律看不出来（本项目反复踩过「断言绿、行为红」的坑）。
+#
+# 桩：脚本里大部分探测要 root / 真实系统（detect_os 要 /etc/os-release、
+# require_root 要 uid 0、阶段函数要装包写配置）。本机是 Windows Git Bash，
+# 这些要么没有要么不能碰（红线 6：不碰生产服务器）。所以把 main 的全部外部依赖
+# 都换成桩 —— 函数在 bash 里是动态查的，裸函数名调用会查到后定义的顶层函数，
+# 桩定义在 source 之后就能盖住脚本里原有的同名函数。
+#   依赖探测类（require_root / validate_inputs / detect_os / detect_arch /
+#   preflight）→ 直接成功；cleanup → 空操作，别去 rm -rf 一个假 TMP_DIR。
+#   7 个阶段函数 → 默认成功；调用方在 $call 里再定义一次就能盖掉任意一个
+#   （验证的目标是 main 的退出码判定，不是重测 7 个阶段 ——
+#    阶段自身的行为由完整自检与 no_bare_die_in_stages 覆盖）。
+# run_stage 保留真身（它本身是纯控制流，只依赖那几个桩）—— 这样才能真正走到
+# 「阶段返回非 0」的分支上，而不是被一个转调桩糊过去。
+_verify_exit_sandbox() { # <main 调用体> —— 在剥掉 main "$@" 的副本里跑，打印退出码
+	local call="$1" lib="" out="" rc=0
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		require_root() { return 0; }
+		validate_inputs() { return 0; }
+		detect_os() { return 0; }
+		detect_arch() { return 0; }
+		preflight() { return 0; }
+		cleanup() { return 0; }
+		gather_state() { return 0; }
+		install_deps() { return 0; }
+		install_caddy_binary() { return 0; }
+		setup_user_and_dirs() { return 0; }
+		write_config() { return 0; }
+		write_camouflage_site() { return 0; }
+		install_service() { return 0; }
+		verify_deployment() { return 0; }
+		trap - EXIT
+		# 调用体经 $2 传进来、用 eval 执行，而不是拼进这段脚本的末尾：
+		# 拼进来的那段以「换行 + 制表符」收尾（调用方 heredoc 的缩进），
+		# 于是后面的 `|| rc=$?` 会落在新行行首 —— `行首 ||` 是语法错误（实测）。
+		# eval 没有这个毛病。
+		# `|| rc=$?`：脚本是 set -e，裸调 main 返回非 0 时这段 shell 会当场退出、
+		# printf 根本跑不到 —— 那样读到的就不是 main 的退出码了。
+		rc=0
+		eval "$2" || rc=$?
+		printf "__RC__%s\n" "$rc"
+	' _ "$lib" "$call" 2>&1)
+	rc=$?
+	rm -f "$lib"
+	# rc 97 = source 失败（脚本本身坏了），照原样传出去别当成断言结果
+	if [ "$rc" -eq 97 ]; then
+		printf '  子 shell 里 source 主脚本失败（脚本自身有问题）\n' >&2
+		return 1
+	fi
+	printf '%s\n' "$out"
+	return 0
+}
+
+# 只要退出码的那一层（末行是 __RC__<码>）。
+# 单独一层是为了让「退出码」和「输出」两种断言共用同一套桩 ——
+# 桩写两遍就有漂移风险，而这里漂移了会让某条断言悄悄测不到真东西。
+_verify_exit_rc() { # <main 调用体>
+	_verify_exit_sandbox "$1" | sed -n 's/.*__RC__//p' | tail -1
+}
+
+# 行为级：部署完成但验证有 warning 时，main 的退出码必须是 2（不是 0）。
+# 这是本任务的核心 —— 原 bug 正是「4 项验证全失败，退出码照样 0」，
+# `if sudo ./deploy.sh; then` 会当成功。断言必须真跑出那个数字才叫锁住。
+main_exits_2_on_warnings() {
+	_self_test_nested_skip && return 0
+	local got=""
+	# verify_deployment 换成记录 2 条警告的桩 —— 模拟证书还没签发完时
+	# 「本机 HTTPS 握手 + 证书信息」两项没过的真实情形；其余 6 个阶段一律成功。
+	got=$(_verify_exit_rc '
+		verify_deployment() { verify_warn "本机 HTTPS 握手"; verify_warn "证书信息"; return 0; }
+		main --domain a.example.com --email o@m.test
+	')
+	if [ "$got" = "2" ]; then
+		return 0
+	fi
+	printf '  期望「部署完成但有警告」时 main 退出 2（原 bug 是 0）。实得: %s\n' "${got:-（读不到退出码）}" >&2
+	return 1
+}
+
+# 行为级：显式 --skip-verify 时退出码必须是 0 —— 跳过是「没测」，不是「测出问题」。
+# 少了这条，将来有人把判定写成「只要 VERIFY_WARNINGS 非空就 2」，
+# 加了 --skip-verify 的用户会平白拿到非零退出码（CI 里会当失败）。
+main_exits_0_when_skipped() {
+	_self_test_nested_skip && return 0
+	local got=""
+	got=$(_verify_exit_rc '
+		verify_deployment() { VERIFY_SKIPPED="yes"; return 0; }
+		main --domain a.example.com --email o@m.test --skip-verify
+	')
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	printf '  期望 --skip-verify 时 main 退出 0。实得: %s\n' "${got:-（读不到退出码）}" >&2
+	return 1
+}
+
+# 行为级：全部验证通过时退出码 0 —— 正常路径不能被新逻辑带歪。
+main_exits_0_when_clean() {
+	_self_test_nested_skip && return 0
+	local got=""
+	got=$(_verify_exit_rc '
+		verify_deployment() { return 0; }
+		main --domain a.example.com --email o@m.test
+	')
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	printf '  期望验证全过时 main 退出 0。实得: %s\n' "${got:-（读不到退出码）}" >&2
+	return 1
+}
+
+# 行为级：退出 2 的那一次，摘要必须是**已经打印过**的 —— 密码与 client-config.json
+# 都拿到了，只是有几项没确认。这是红线 1 真正要保的东西：判定一旦跑到
+# print_summary 前面（或 verify_deployment 里 exit/die），用户就会「只拿到退出码 2、
+# 拿不到密码」。上面那条顺序断言是静态比对行号，这条是行为级复核 ——
+# 把判定挪进 verify_deployment 的写法（经 run_stage exit 1）也会被它逮住。
+summary_printed_before_exit2() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_verify_exit_sandbox '
+		verify_deployment() { verify_warn "本机 HTTPS 握手"; return 0; }
+		main --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" != "2" ]; then
+		printf '  前置条件不成立：这次 main 没退出 2（实得 %s），无法判断摘要\n' "${got:-（读不到）}" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q '项需要你确认'; then
+		printf '  退出 2 了，但摘要抬头没打印 —— 用户看不到「部署完成了但有 N 项要确认」\n' >&2
+		printf '  实际输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q '密码'; then
+		printf '  退出 2 了，但摘要里没有密码那一行 —— 这正是红线 1 禁止的后果\n' >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级：verify_deployment 的 ②③④⑤ 四项「只记数、不改退出码」（红线 2）。
+# 为什么不能只断字符串：本函数里 verify_warn 有 4 处调用，随手删掉其中一处
+# 改成 `return 1`，剩下 3 处照样喂饱 `has … verify_warn` —— 断言是绿的，
+# 行为却已经把「证书还在签发」误报成致命失败。实测过：这种改法
+# 能骗过字符串断言。所以真跑一遍 verify_deployment：
+# 桩出「证书还没签发完」的现实条件（网络全不通），看它是不是
+# 四项全记数、退出码仍然是 0。
+verify_items_only_count() {
+	_self_test_nested_skip && return 0
+	local lib="" out="" rc=0 got="" warns=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		# 现实条件：证书还在签发中，四项必然全不过
+		INIT=""
+		SKIP_VERIFY="no"
+		CREDS_KNOWN="yes"
+		DOMAIN="a.example.com"; HTTPS_PORT="443"
+		NAIVE_USER="naive"; NAIVE_PASS="Aa12345678"
+		# 网络与系统命令全部离桩：本机判定不许碰真网络、不许动 /etc/hosts
+		curl() { return 1; }
+		openssl() { return 1; }
+		systemctl() { return 1; }
+		journalctl() { return 0; }
+		get_public_ip() { return 1; }
+		node_local_hosts_hack() { return 0; }
+		rc=0
+		verify_deployment >/dev/null 2>&1 || rc=$?
+		printf "__RC__%s WARNS__%s\n" "$rc" "$VERIFY_WARNINGS"
+	' _ "$lib" 2>&1)
+	rm -f "$lib"
+	got=$(printf '%s' "$out" | sed -n 's/.*__RC__\([0-9]*\).*/\1/p' | tail -1)
+	warns=$(printf '%s' "$out" | sed -n 's/.*WARNS__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "$got" = "0" ] && [ "$warns" = "4" ]; then
+		return 0
+	fi
+	printf '  期望四项都没过时：退出码 0、警告数 4。实得退出码 %s / 警告数 %s\n' \
+		"${got:-（读不到）}" "${warns:-（读不到）}" >&2
+	printf '  退出码非 0 = 有人把 ②③④⑤ 改成 return 1 了（首次部署会误报失败）\n' >&2
+	printf '  原始输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+# 结构性：退出码 2 的判定必须在 main 里的 print_summary 之后。
+# 只看顺序不比内容 —— 顺序错了（判定在摘要前）就等于「验证没过时用户看不到密码」，
+# 那正是红线 1 要挡的后果，而且用字符串匹配根本看不出来。
+exit2_check_after_summary() {
+	local tgt="" sum_line="" dec_line=""
+	tgt=$(awk '
+		/^main\(\) \{/ { inside = 1 }
+		!inside { next }
+		/^\}/ { exit }
+		/^[ \t]*print_summary[ \t]*$/ { if (psum == 0) psum = NR }
+		# 判定那一行的锚点取 VERIFY_WARNINGS：main 里只有判定会碰它，
+		# 且这样写不绑死比较运算符 —— `-gt 0` 换一种等价写法不该让断言假红。
+		# （条件本身写反由行为断言负责逮，不由这里。）
+		/VERIFY_WARNINGS/ { if (dec == 0) dec = NR }
+		END { printf "%d %d", psum, dec }
+	' "$0")
+	sum_line="${tgt%% *}"
+	dec_line="${tgt##* }"
+	if [ "${sum_line:-0}" -eq 0 ] || [ "${dec_line:-0}" -eq 0 ]; then
+		printf '  main 里找不到 print_summary 调用（行 %s）或退出码判定（行 %s）\n' \
+			"${sum_line:-0}" "${dec_line:-0}" >&2
+		return 1
+	fi
+	if [ "$sum_line" -lt "$dec_line" ]; then
+		return 0
+	fi
+	printf '  判定在第 %s 行、print_summary 在第 %s 行 —— 判定在前，验证没过时摘要不会打印\n' \
+		"$dec_line" "$sum_line" >&2
 	return 1
 }
 
@@ -4332,6 +4593,50 @@ SSLCNF
 	# 过滤「静默失效」（最危险的一种坏法）：报数行照旧漂亮，实际却跑满全量。
 	# 只数真跑出来的 PASS，不看报数行，才逮得住。
 	true_case "子集只跑命中的断言、不多跑" self_test_subset_isolates_sections
+
+	fi
+	# ---- 20) 退出码 2：部署完成但验证未确认（v2.6.0 新增）----
+	# 这一节纯新增，既有 393 条一行没动。
+	# 全部是行为级：真起子进程跑一次 main 看退出码，不匹配源码字符串 ——
+	# 「源码里写了 return 2」不等于「真退出 2」，本项目踩过太多次这种假绿。
+	if st_want 20; then
+	printf '\n[20] 退出码 2（部署完成但验证未确认）\n'
+
+	# ---- 20a) 红线 1：判定逻辑绝不能进 verify_deployment ----
+	# 在 verify_deployment 里写 exit/die 会经 run_stage 直接 exit 1、跳过 print_summary，
+	# 用户拿不到密码与 client-config.json。这条断言直接盯着函数体里的 exit/die。
+	# 用 fn_code（剥掉注释）：注释里解释「这里不能 exit」不算数 ——
+	# 否则把真代码换成 exit 1、注释留着，断言依然绿。
+	true_case "verify_deployment 里没有 exit" \
+		not_has "$(fn_code verify_deployment)" '(^|[^a-zA-Z_.])exit([^a-zA-Z_]|$)'
+	true_case "verify_deployment 里没有 die" \
+		not_has "$(fn_code verify_deployment)" '(^|[^a-zA-Z_])die[[:space:]]'
+	# 反向证伪：这正是红线 2 要保留的语义 —— ②③④⑤ 只记数、不改退出码。
+	# 若有人把它们改成 `return 1`，首次部署（证书还在签发）会误报致命失败。
+	# 必须行为级：字符串匹配「函数里出现过 verify_warn」挡不住「删掉其中一处改成
+	# return 1、剩下 3 处照样喂饱断言」—— 证伪实验实测过这种假绿。
+	true_case "验证的 4 项仍只记数（没被改成 return 1）" verify_items_only_count
+
+	# ---- 20b) 红线 2 的守卫：判定放在 print_summary 之后 ----
+	# 拿 main 的源码行号比：print_summary 那行必须早于判定那行。
+	# 顺序错了（判定在前）就意味着验证没过时摘要不打印 —— 正是红线 1 的后果。
+	true_case "退出码 2 的判定在 print_summary 之后" exit2_check_after_summary
+
+	# ---- 20c) 行为：三种情形各自的真实退出码 ----
+	true_case "有警告时 main 退出 2（原 bug 是 0）" main_exits_2_on_warnings
+	true_case "--skip-verify 时 main 退出 0" main_exits_0_when_skipped
+	true_case "验证全过时 main 退出 0" main_exits_0_when_clean
+	# 红线 1 的行为级复核：退出 2 时密码必须已经打印出来了
+	true_case "退出 2 时摘要（含密码）已打印" summary_printed_before_exit2
+
+	# ---- 20d) 文案：用户与下一个人都得看得懂 ----
+	# 横幅补「退出码 2」：不然人看到进程码 2 会以为参数写错了。
+	true_case "横幅写明退出码是 2" has "$(fn_body print_summary)" '退出码 2'
+	# usage 必须把三段语义写清楚（0/1/2 + --skip-verify 记 0），不能让下一个人猜。
+	true_case "usage 收录退出码 0/1/2 三段说明" has "$(fn_body usage)" '退出码：'
+	true_case "usage 说明 --skip-verify 记 0" has "$(fn_body usage)" 'skip-verify.*退出码仍记 0'
+	true_case "usage 说明 2 表示部署已完成" has "$(fn_body usage)" '部署已经完成'
+	true_case "usage 说明 2 不是参数写错" has "$(fn_body usage)" '参数写错了'
 
 	fi
 # ST_ASSERT_END
