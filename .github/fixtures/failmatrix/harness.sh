@@ -330,6 +330,13 @@ main() {
 	rc_c=$(run_deploy "$OUT/run-c.log"); residue >"$OUT/residue-c.txt"
 	say "恢复跑退出码 = $rc_c"
 
+	# 撤销注入后的这一次是【干净部署】—— 开机自启必须真的设上（F1/F2 的正向断言）。
+	# 它不证明「enable 失败时会报」，但能逮住把 enable 改成 return 1、或把
+	# `if ! systemctl enable` 的取反写丢这类改法 —— 那会让机器重启后 caddy
+	# 不自启，而部署当下一切看起来正常。systemctl 不可用时记 none，由 workflow 判负。
+	svc_enabled_c=$(systemctl is-enabled caddy 2>/dev/null || echo none)
+	say "恢复跑后 is-enabled = $svc_enabled_c"
+
 	local banner="no" glyph="no" failmsg="no"
 	grep -q "第 ${STAGE} 步 / 共 7 步" "$OUT/run-a.log" && banner="yes"
 	grep -q '✗' "$OUT/run-a.log" && glyph="yes"
@@ -346,6 +353,7 @@ main() {
 		echo "HAS_FAIL_WORD=$failmsg"
 		echo "RERUN_STABLE=$([ "$rc_a" = "$rc_b" ] && echo yes || echo no)"
 		echo "LIFT_CLEAN=$LIFT_CLEAN"
+		echo "SVC_ENABLED_C=$svc_enabled_c"
 	} >"$OUT/result.env"
 	cat "$OUT/result.env"
 }

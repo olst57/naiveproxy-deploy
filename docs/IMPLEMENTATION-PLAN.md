@@ -96,6 +96,56 @@ grep -nE '^(do_check|main|confirm|check_domain_dns|check_ports_free|print_summar
 | `docs/Execution-Flow.md:655-656` | 「B 必须不晚于 A」 | 改为「**B 与 A 必须同批，且 B 的 `confirm` 必须受 `ASSUME_YES` 管辖**」（理由见 §四） |
 | `docs/Execution-Flow.md:618` | `#### H. 计数口径漂移` | 引用时要写 **H**（本文件初版误写成 I） |
 
+#### Phase 0 本轮机检新发现（2026-10-16，实施者追加 —— 上表保留不动）
+
+**核心数字（先记死，全篇引用都以这一组为准）**：
+
+| | 字面 `_case` 行 | 实跑 PASS | 差值 | 区段 |
+| --- | --- | --- | --- | --- |
+| **A3 之前**（= `HEAD`） | **403** | **406** | **+3** | 20 |
+| **A3 之后**（= 本批次交付） | **407** | **410** | **+3** | 20 |
+
+机检方法：见本文件 §0.1 的 `grep`，外加 `grep -cE '^[[:space:]]*(true|false|eq|skip|rc)_case ' deploy-naive-caddy.sh` 与 `--self-test | grep -c '  PASS '`。
+**A3 净增 4 条**（`19d` 的 4 条），**差值 +3 两次都成立** —— 说明差值是**结构性的**，不随新增变化。
+
+**+3 的完整拆解**（本轮实读，可复现）：
+```
+for i in 1..7（3992）: 1 条字面 → 展开 7 条   = +6
+手工 pass（3855）    : 0 条字面 → 1 条 PASS   = +1
+4 条 skip_case 行     : 计入字面，本次未走到分支（0 SKIP） = -4
+                                       合计 = +3  ✓
+```
+
+| 位置 | 现状 | 应为 | 证据 / 说明 |
+| --- | --- | --- | --- |
+| **本文件 §0.1 的机检命令本身漏了 `verify_warn` / `port_state`** | 命令只列到 `do_uninstall` | 补 `verify_warn`（**2188**）、`port_state`（**1499**） | **BATCH-A 的命令已含这两个**，本文件 §0.1 的版本没有 —— 两处命令不一致，照本文件跑会漏掉两条 |
+| `deploy-naive-caddy.sh:4028` / `:4030`（`非 root 安装被拦` / `非 root 拦截`） | 两条断言在 `if [ "$(id -u)" -ne 0 ]` 里（**4027**） | 非 root 与 root **各跑一条**、另一条 `skip_case` | 本机 `id -u`=197609（Git Bash，**非 root**）⇒ 跑 `false_case`、跳过 `skip_case`。**这不是错**，但「0 跳过」是**平台相关**的，换台机器就会变 |
+| `deploy-naive-caddy.sh:4357`（`if [ "$ok_cert" = "yes" ]`，签证书在 **4353**） | 签名成功才跑 4 条真断言；否则 **4363** `skip_case` | 本机 openssl 签不出 ⇒ 整块 `skip_case` | 故 **skip 数在 openssl 不可用的机器上会 >0**，与上条同源 |
+| `deploy-naive-caddy.sh:4337` `if command -v openssl` 的 `else`（**4367** `skip_case`） | 本机无 openssl 时整节跳过 | 有 openssl 时不走这条 | 同理；两条 `skip_case` 是互斥分支，同一环境只会走一条 |
+| `deploy-naive-caddy.sh:3992` 的 `for i in 1 2 3 4 5 6 7` | 循环体 **1 条字面** `_case`（**3993**），展开 **7 条** | 净 **+6** | 差值第一项 |
+| `deploy-naive-caddy.sh:3855` 手工 `pass=$((pass + 1))`（`两次生成不重复`） | **不经过任何 `_case` 辅助** | 字面/扫描器都数不到 | 差值第二项 **+1** |
+| 4 处 `skip_case`（**3955** / **4030** / **4363** / **4367**） | 计入字面，未走到分支时不计 PASS | — | 差值第三项 **-4**。⇒ **+6 +1 -4 = +3**，与实测一致（本轮实读） |
+| `.github/workflows/alpine-openrc.yml:34` / `:40` 的 `apk add` | 清单里**没有 `iproute2`** | Phase 1 的 G 项要在此加断言时**必须不依赖 `ss`** | 否则「ubuntu 绿、Alpine 红」；本文件 §1.5 已警告过，此处记实测行号 |
+| `docs/Execution-Flow.md:608`（`#### G` 的代码块小标题 `*)   # 1598-1607`） | 写 **1598-1607** | `check_ports_free` 的 `*)` 实为 **1604-1607**（`note` 在 **1605**）。⇒ 引用应为 **1604-1607** | 1598 是**端口被占**分支的 `confirm`，不是 `*)`。**EF 同段（`:605`）把 `note` 所在行（1605）写对了**，只有区间起点错 |
+| `docs/Execution-Flow.md` §10.4 **A2** | 写 `do_check` 为「**2663-2788**」 | 定义 **2663**、结尾 `}` 在 **2788** | 复核**无误**（保留，记录已核） |
+| `.github/workflows/ci.yml:74-83` | 版本号 ↔ CHANGELOG 硬门禁 | 复核**属实**（`grep -qE "^## \[${ver}\]"` 在 **78**） | `SCRIPT_VERSION="2.6.1"`（`deploy-naive-caddy.sh:74`）↔ `CHANGELOG.md:13 ## [2.6.1]` —— 当前**一致** |
+| `.github/fixtures/failmatrix/harness.sh:271` | `svc-enabled` | 复核**属实**（在 **271**） | |
+| `.github/fixtures/failmatrix/harness.sh:40` | `--yes` | 复核**属实**（在 **40**，`DEPLOY_ARGS` 末尾） | |
+| 本文件 **U2** 条（「字面 403 / 实跑 406 / +6 与 +3 对不上，来源未定位」） | 判为「来源未定位」 | **本轮已定位**，且差值是 **+3** 不是 +7：**+6（`for i in 1..7` 展开）＋ 1（手工 `pass`）− 4（4 处 `skip_case` 本次未走到分支）＝ +3** | U2 里「实跑 406」是 A3 **之前**的读数，与字面 403 配成 +3 ✅；A3 之后为 **407/410**，差值仍是 +3。**U2 的「+6 对不上 +3」是把 `skip_case` 与手工 `pass` 漏算了** |
+| 本文件 **U8** 的交叉引用（`3452`/`3479`/`3492`/`3421`/`3779`） | 规划为「Phase 0 机检」 | **本轮逐条复核：全部属实**（`3421`=`summary_printed_before_exit2`、`3452`=`verify_items_only_count`、`3479`=「`warns = 4`」判定、`3492`=`exit2_check_after_summary`、`3779`=`for st_fn in …`） | ⚠️ **A3 落地后这 5 个行号整体下移**：`3441`/`3472`/`3499`/`3512`/`3813`。引用行号以**收尾时的重取值为准**（见下条注） |
+| 本文件 §0.1 表首行「`run_stage` 失败路径 **429-436**」 | 脚本 `3079` 的注释写 `427-434` | 复核：定义在 **422**、`if "$@"` 在 **429**、`exit 1` 在 **436** —— **建议值正确** | `3079` 的注释仍是旧值 `427-434`，**A1 未修**（不在 BATCH-A 的 4 处清单内，故留待 Phase 1 一并改） |
+
+**机检方法（可复现）**：
+```bash
+cd naiveproxy
+grep -nE '^(do_check|main|confirm|check_domain_dns|check_ports_free|print_summary|install_service|install_caddy_binary|verify_deployment|do_rotate_password|preflight|run_stage|do_uninstall|verify_warn|port_state)\(\) \{' deploy-naive-caddy.sh
+grep -cE '^[[:space:]]*(true|false|eq|skip|rc)_case ' deploy-naive-caddy.sh
+bash ./deploy-naive-caddy.sh --self-test 2>&1 | grep -c '  PASS '
+```
+注：**行号会随任何增删漂移** —— A3 加 `rc_case` 后，全部引用整体下移最多 **+20** 行
+（例：`renderers_silent` 3596 → **3616**）。**引用行号必须在本批次收尾时重取一次**，
+`alpine-openrc.yml` 的两处引用即按重取后的值定稿（`3616` / `1341`）。
+
 ### 0.3 派活：回头修 `docs/Execution-Flow.md` 的两处旧措辞
 
 **这是 Phase 0 的产出物之一，不是可选项。** 不做的后果：两份文档带着**互相矛盾**的结论进仓库，

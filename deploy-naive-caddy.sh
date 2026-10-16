@@ -65,13 +65,16 @@
 #     ～ 主流程
 #     ～ 自检用的顶层辅助
 #     ～ 退出码 2 的行为级断言辅助
+#     ～ do_check 的沙箱（退出码判定专用）
 #     ～ 开发者自检
+#     ～ A（非 TTY Default-Deny）的沙箱
+#     ～ B（check_domain_dns 两分支）的断言
 #     ～ 子集过滤（--self-test <模式>）
 # ST_INDEX_END
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.1"
+SCRIPT_VERSION="2.7.0"
 CADDY_FALLBACK_TAG="v2.11.7-naive"
 GH_REPO="klzgrad/forwardproxy"
 CADDY_BIN="/usr/bin/caddy"
@@ -438,7 +441,7 @@ run_stage() { # <序号> <函数...>
 # ---------------- 帮助与引导 ----------------
 usage() {
 	cat <<'USAGE'
-NaiveProxy 服务端部署脚本 v2.6.1
+NaiveProxy 服务端部署脚本 v2.7.0
 把这台服务器变成一台 NaiveProxy 服务端（Caddy + 伪装站点）。
 
 第一次用？按这个顺序走：
@@ -467,7 +470,9 @@ NaiveProxy 服务端部署脚本 v2.6.1
                            NAIVE_PASSWORD='你的密码' sudo -E ./deploy-naive-caddy.sh ...
   --https-port <端口>    HTTPS 监听端口（默认: 443）
   --check                体检：环境 + 前置条件逐条判定 + 配置预览（只读，无需 root）
-  -y, --yes              所有确认自动回答「是」
+  -y, --yes              预检发现问题时别问我，直接继续（无人值守部署必须显式加）
+                         没加它、又没有终端可问（Ansible / CI / 管道 / cron）时，
+                         脚本一律按「中止」处理 —— 宁可停下，也不替你猜「继续」。
 
 进阶参数：
   --probe-secret <域名>    probe_resistance 的秘密域名。指定后，只有访问这个地址才会触发
@@ -525,10 +530,19 @@ NaiveProxy 服务端部署脚本 v2.6.1
   0  成功；按回车主动取消；或显式用了 --skip-verify
   1  失败 —— 参数不合法、环境不满足、或部署中某个阶段没通过。
      这时摘要不会打印，密码和客户端配置也不会生成。
-  2  部署已经完成 —— 密码与 client-config.json 都照常打印，
-     只是阶段 7 的验证里有几项没能当场确认（本机 HTTPS 握手 / 证书信息 /
-     代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，
-     过几十秒重跑同一条命令复查即可；全过之后退出码就是 0。
+     另外，--check 体检发现需要先处理的问题时也退 1：这样
+     `if ./deploy-naive-caddy.sh --check; then` 才真的代表体检通过。
+     体检本身仍然是只读的，退 1 只是「有情况」，不是「跑失败了」。
+     还有一类：预检报出警告、而当前又没有终端可以问（Ansible / CI / 管道 / cron）
+     且没加 --yes —— 这时脚本按「中止」处理。无人值守部署请显式加 --yes。
+  2  部署已经完成 —— 密码与 client-config.json 都照常打印，只是有情况要你知道。
+     分两类：
+       · 没能当场确认 —— 阶段 7 的验证有几项没测出来（本机 HTTPS 握手 / 证书信息 /
+         代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，过几十秒
+         重跑同一条命令复查即可。
+       · 已经确认有问题 —— 开机自启没设上、client-config.json 没写成这类。
+         它们不会自己好，要按摘要里那条提示动手修一次，再重跑同一条命令复查。
+     两类都算「部署完成」；复查全过之后退出码就是 0。
      脚本退出码 2【不是】「参数写错了」—— 那种情况是 1，参数解析在部署之前。
 
 运维：
@@ -1525,11 +1539,18 @@ show_port_owner() { # <端口>
 
 # ---------------- 确认 ----------------
 # 用户按回车取消不是错误 —— 不要给红色 ✗ 和 exit 1，那会让人以为搞坏了。
+#
+# 交互式的那条路（底下 case 的 *）刻意保持 exit 0 + 无红字 —— 自检里有断言锁着它。
+# 非交互（stdin 不是终端：Ansible / CI / 管道 / cron）则相反，走 Default-Deny：
+# 以前这里「读不到键盘输入」当成「继续」，于是无人值守跑部署时，预检报的每一项
+# 警告都被自己的默认值放行 —— 警告照打、退出码 0、部署继续，等于没做预检。
+# 现在拒绝（return 1），由调用方把失败显式传上去。想显式放行只有 --yes 一条路。
 confirm() {
 	local prompt="$1" ans=""
 	if [ ! -t 0 ]; then
-		warn "读不到键盘输入，已按「继续」处理"
-		return 0
+		warn "读不到键盘输入（非交互），「${prompt}」无法确认 —— 已按「中止」处理"
+		note "  无人值守部署请显式加 --yes 表示「预检发现问题也别问我」"
+		return 1
 	fi
 	read -r -p "  ${prompt} [y/N] " ans
 	case "$ans" in
@@ -1552,11 +1573,21 @@ check_domain_dns() {
 		else
 			warn "域名解析到 ${dns}，而本机公网 IP 是 ${ip}"
 			warn "如果之后证书签发失败，通常就是这里。走 CDN 的话请先把 Cloudflare 橙云切成灰云。"
-			[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？"
+			[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？" || return 1
 		fi
-	else
-		warn "无法自动核对解析（本机 IP=${ip:-未知}，DNS=${dns:-未知}）"
+	elif [ -z "$dns" ]; then
+		# (c) 域名真的查不到 A 记录 —— 证书签发必然失败，与上面「解析到别的 IP」同级，
+		# 所以处置也同级（问人）。以前这两种情况共用一个 else，于是「查不到」被
+		# 混进「无法判定」里一声不响地放过。
+		warn "域名 ${DOMAIN} 查不到 A 记录（本机 IP=${ip:-未知}）"
 		warn "请确认域名的 A 记录已经指向这台服务器 —— 证书签发依赖它"
+		[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？" || return 1
+	else
+		# (d) 域名解析是好的，只是本机公网 IP 拿不到（get_public_ip 依赖外部
+		# IP 服务，任一不可达即返回空）。这时判定不可靠，问人是噪音 ——
+		# 只警告，不问、也不拦住。与上面 (c) 刻意分开，别合回去。
+		warn "无法核对解析：域名 ${DOMAIN} 解析到 ${dns}，但本机公网 IP 没取到"
+		warn "请自行确认域名的 A 记录已经指向这台服务器 —— 证书签发依赖它"
 	fi
 }
 
@@ -1572,7 +1603,7 @@ check_probe_secret_dns() {
 		warn "${PROBE_SECRET} 查不到 A 记录 —— 秘密链接会连不上"
 		warn "  证书只覆盖已解析的域名。请把 ${PROBE_SECRET} 也指向本机，"
 		warn "  否则 TLS 握手会失败（连 407 都触发不了）"
-		[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？"
+		[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？" || return 1
 	else
 		ok "秘密域名 ${PROBE_SECRET} 已解析（${dns}）"
 	fi
@@ -1595,15 +1626,23 @@ check_ports_free() {
 					warn "端口 ${p} 已被别的程序占用："
 					show_port_owner "$p"
 					warn "Caddy 需要 443（对外服务）和 80（证书校验与跳转）。占用者通常是 Nginx / Apache。"
-					[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？"
+					[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？" || return 1
 				fi
 				;;
 			free)
 				ok "端口 ${p} 空闲"
 				;;
 			*)
-				note "端口 ${p}：本机没有 ss 命令，无法判定，请自行确认"
+				# 与本函数 in-use 分支里那句「仍然继续？」同格：两者都是「我无法
+				# 确认这个端口能给你用」，处置也必须同级 —— 让用户确认后再继续，
+				# 而不是 note 一行就放过。
+				# 刻意不写行号：这个项目里写死的行号改一次文件就漂一次，
+				# 索引里的 index_has_line_numbers 断的就是这件事。
+				# 口径与 do_check 的端口 *) 分支一致（那边计入 problems、退非 0），
+				# 否则同一台机器上 preflight 与 --check 会给出不同裁决。
+				warn "端口 ${p}：本机没有 ss 命令，无法判定是否被占用"
 				note "  装上就能自动查：apt install iproute2（或 dnf install iproute / apk add iproute2）"
+				[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？" || return 1
 				;;
 		esac
 	done
@@ -1617,9 +1656,15 @@ preflight() {
 		err "没找到 systemd 或 openrc，本脚本暂不支持这个系统"
 		return 1
 	fi
-	check_domain_dns
-	check_probe_secret_dns
-	check_ports_free
+	# ⚠️ 三个 `|| return 1` 是刻意写的，删掉它们 = 把 A 变成假修：
+	# main 里是 `preflight || exit 1`，而 `A || B` 会挂起 A 内部的 errexit，
+	# 于是 preflight 里任何一句失败都【不会】让函数提前返回 —— 它的返回值
+	# 只等于自己最后一条命令（下面那句 `ok "预检完成"` = 0）。
+	# 结果就是：预检报了一堆警告、confirm 也拒了，main 依然 rc=0、部署继续。
+	# 必须在这里把三个 check_* 的失败显式抬到 preflight 的返回值上。
+	check_domain_dns || return 1
+	check_probe_secret_dns || return 1
+	check_ports_free || return 1
 	if [ ! -d /proc/sys/net ]; then
 		warn "这看起来不是 Linux；本脚本请只在目标 VPS 上运行"
 	fi
@@ -1871,6 +1916,9 @@ install_caddy_binary() {
 			fi
 			ok "下载校验通过（sha256 与官方发布一致）"
 		else
+			# 「上游没给 digest」≠「校验通过」。当时那一行 warn 会滚走，
+			# 而用户是照着摘要做验收的 —— 记一个跨阶段标志，让摘要把这件事说出来。
+			CADDY_DIGEST_MISSING="yes"
 			warn "该发布没有提供校验和，无法验证下载完整性"
 		fi
 
@@ -2153,7 +2201,12 @@ install_service() {
 		backup_if_exists "${SVC_FILE}"
 		render_systemd_unit > "${SVC_FILE}" || { err "写入 ${SVC_FILE} 失败"; return 1; }
 		systemctl daemon-reload || true
-		systemctl enable caddy >/dev/null 2>&1 || true
+		# 自启设不上必须说出来：用户以为「装好了」，重启后服务却不会起来。
+		# 但【不能】return 1 —— 那会经 run_stage 的 exit 1 跳过 print_summary，
+		# 用户拿不到密码（假失败）。verify_warn 只记数，由 main 末尾统一退 2。
+		if ! systemctl enable caddy >/dev/null 2>&1; then
+			verify_warn "开机自启没设上（systemctl enable caddy 失败）—— 重启后 caddy 不会自动启动，请手动执行: systemctl enable caddy"
+		fi
 		if systemctl is-active --quiet caddy; then
 			systemctl restart caddy || { err "重启 caddy 失败"; return 1; }
 		else
@@ -2165,7 +2218,10 @@ install_service() {
 		backup_if_exists "${OPENRC_FILE}"
 		render_openrc_script > "${OPENRC_FILE}" || { err "写入 ${OPENRC_FILE} 失败"; return 1; }
 		chmod +x "${OPENRC_FILE}"
-		rc-update add caddy default >/dev/null 2>&1 || true
+		# 同 systemd 支：只记数、不 return 1（否则摘要被跳过，用户丢密码）
+		if ! rc-update add caddy default >/dev/null 2>&1; then
+			verify_warn "开机自启没设上（rc-update add caddy default 失败）—— 重启后 caddy 不会自动启动，请手动执行: rc-update add caddy default"
+		fi
 		rc-service caddy restart || rc-service caddy start || { err "启动 caddy 失败"; return 1; }
 		ok "openrc 服务已启动"
 	else
@@ -2184,6 +2240,11 @@ VERIFY_WARNINGS=0
 # 跳过验证 != 验证通过。摘要必须能区分这两件事。
 VERIFY_SKIPPED="no"
 VERIFY_NOTES=()
+# 阶段 2 设、摘要读的跨阶段状态：上游这个发布没提供 sha256，本次没做下载校验。
+# 与 VERIFY_SKIPPED 同族 —— 都是「状态回显」，刻意【不】算 verify_warn：
+# 是否提供 digest 由上游决定，用户在本机修不了，记成警告会让每次部署都退 2
+# （那是假失败）。上游侧另有守门：upstream-drift.yml 每天查 digest 并 ::error::。
+CADDY_DIGEST_MISSING="no"
 
 verify_warn() { # <一句话说明这一项没通过>
 	VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1))
@@ -2386,9 +2447,22 @@ print_summary() {
 	local host="${DOMAIN}"
 	if [ "$HTTPS_PORT" != "443" ]; then host="${DOMAIN}:${HTTPS_PORT}"; fi
 
+	# 写没写成，决定下面那行广告怎么写 —— 不能写失败了还照说「已存到 X，权限 0600」。
+	# 这里【不能】die：摘要正在打印、用户还要拿密码。用 verify_warn：它参与 main
+	# 末尾的退出码判定（→ 退 2），正是「部署完成但有一项没做成」的语义。
+	local conf_state="missing"
 	if [ "$CREDS_KNOWN" = "yes" ]; then
-		render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" || true
-		chmod 0600 "${CLIENT_CONF}" 2>/dev/null || true
+		if render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}"; then
+			# 权限也是这份配置的一部分：里面是明文密码，收不紧同样得说出来
+			if chmod 0600 "${CLIENT_CONF}" 2>/dev/null; then
+				conf_state="ok"
+			else
+				conf_state="insecure"
+				verify_warn "${CLIENT_CONF} 权限没能设成 0600（里面是明文密码）—— 请手动执行: chmod 0600 ${CLIENT_CONF}"
+			fi
+		else
+			verify_warn "客户端 config.json 没能写到 ${CLIENT_CONF} —— 下面那一段请自己复制保存成文件"
+		fi
 	fi
 
 	# 「部署完成」和「验证通过」必须是两个词 —— 别让用户以为一切正常
@@ -2406,7 +2480,8 @@ print_summary() {
 		for n in "${VERIFY_NOTES[@]}"; do
 			printf '%s\n' "  ${C_YEL}${G_WARN}${C_RST} ${n}"
 		done
-		printf '%s\n' "  ${C_DIM}这几项多半几十秒内会自己好（证书还在签发）。过一会儿重跑同一条命令即可复查。${C_RST}"
+		printf '%s\n' "  ${C_DIM}证书签发那类几十秒内会自己好；其余（如开机自启、config 没写成）不会自己好，${C_RST}"
+		printf '%s\n' "  ${C_DIM}要按上面那条提示动手修一次，再重跑同一条命令复查。${C_RST}"
 		printf '%s\n' "  ${C_DIM}退出码 2 = 部署已完成（不是失败）；复查全过之后就会变成 0。${C_RST}"
 	fi
 
@@ -2415,6 +2490,13 @@ print_summary() {
 	info "  端口      ${HTTPS_PORT}"
 	info "  配置文件  ${CONF_FILE}"
 	info "  日志      ${LOG_DIR}/access.log"
+	# 阶段 2 没做完整性校验这件事，不能只在当时一行灰字里滚过去 —— 用户照着摘要验收。
+	# 退出码刻意保持 0：上游给不给 digest 不是本机的部署质量，用户也修不了。
+	if [ "${CADDY_DIGEST_MISSING}" = "yes" ]; then
+		warn "  完整性    本次未做下载校验 —— 上游这个发布没有提供 sha256，无从比对"
+		warn "            这不是本机的问题，也不影响已装好的 caddy 能不能跑"
+		warn "            上游补上校验和后，重跑 --upgrade 会自动开始校验"
+	fi
 
 	# 证书这一环单独说清楚：用户最关心的两个问题是「谁签的」和「会不会自动续」。
 	print_cert_summary
@@ -2425,7 +2507,17 @@ print_summary() {
 		printf '%s\n' "    密码      ${C_BLD}${NAIVE_PASS}${C_RST}   ${C_DIM}← 现在复制这一串${C_RST}"
 		printf '\n%s\n\n' "    ${C_DIM}忘了密码？  sudo cat ${STATE_FILE}${C_RST}"
 
-		printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_DIM}（已存到 ${CLIENT_CONF}，权限 0600）${C_RST}"
+		case "${conf_state}" in
+			ok)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_DIM}（已存到 ${CLIENT_CONF}，权限 0600）${C_RST}"
+				;;
+			insecure)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_YEL}（已存到 ${CLIENT_CONF}，但权限不是 0600 —— 里面是明文密码，请手动收紧）${C_RST}"
+				;;
+			*)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_YEL}（没能写入 ${CLIENT_CONF} —— 请把下面这段自己存成 config.json）${C_RST}"
+				;;
+		esac
 		render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" | sed 's/^/    /'
 		printf '\n%s\n\n' "    ${C_DIM}连接串    https://${NAIVE_USER}:${NAIVE_PASS}@${host}${C_RST}"
 		printf '\n%s\n' "  ${C_BLD}客户端连不上时${C_RST}"
@@ -2591,8 +2683,6 @@ do_rotate_password() {
 	chown root:caddy "${CONF_FILE}" || die "设置 ${CONF_FILE} 属主失败"
 
 	state_write || die "更新状态文件失败"
-	render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" || true
-	chmod 0600 "${CLIENT_CONF}" 2>/dev/null || true
 
 	if [ "$INIT" = "systemd" ]; then
 		systemctl reload caddy || systemctl restart caddy || die "重载服务失败"
@@ -2601,6 +2691,17 @@ do_rotate_password() {
 	fi
 	ok "密码已更换，服务已平滑重载"
 	info "  新密码    ${NAIVE_PASS}"
+	# 写 client-config 必须排在「打印新密码」【之后】，而且这里只能用 die：
+	#   · main 里是 `do_rotate_password; return 0` —— 那个 return 0 无条件弃掉退出码，
+	#     用 verify_warn 只会加计数器、退出码照样 0，等于换个地方假绿；
+	#   · 而 die 会终止脚本。若把它排在打印之前，新密码已经生效、服务已经重载，
+	#     用户却看不到密码 —— 直接被锁在门外。
+	# `|| die` 不能省成裸重定向：set -Eeuo pipefail 下重定向失败会当场终止脚本，
+	# 绕过下面这段文案（参照同函数 state_write 的写法）。
+	render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" \
+		|| die "新密码已生效（见上面那一行），但没能写入 ${CLIENT_CONF} —— 请把上面的密码手动填进客户端 config.json"
+	chmod 0600 "${CLIENT_CONF}" 2>/dev/null \
+		|| die "${CLIENT_CONF} 已写入，但权限没能设成 0600（里面是明文密码）—— 请手动执行: chmod 0600 ${CLIENT_CONF}"
 	info "  客户端配置已更新: ${CLIENT_CONF}"
 	warn "记得在客户端也改成新密码 —— 旧密码已经失效"
 }
@@ -2708,8 +2809,12 @@ do_check() {
 			ok "端口 ${p} 空闲"
 			;;
 		*)
-			note "端口 ${p}：本机没有 ss 命令，无法判定（不算问题，但请自行确认）"
-			note "  装上就能自动查：apt install iproute2"
+			# 「我查不了」≠「可以装」。原先这里只 note 一行、不计入 problems，
+			# 于是没有 ss 的机器会拿到「没发现问题，可以正式部署了」——
+			# 而它连 80/443 被谁占着都不知道。
+			warn "端口 ${p}：本机没有 ss 命令，无法判定是否被占用"
+			info "  ${G_ARROW} 装一个就能自动查：apt install iproute2（或 dnf install iproute / apk add iproute2）"
+			problems=$((problems + 1))
 			;;
 		esac
 	done
@@ -2785,6 +2890,17 @@ do_check() {
 		warn "有 ${problems} 项需要先处理（上面标 ${G_WARN} 的）。处理完再跑一次 --check 复查。"
 	fi
 	printf '\n%s\n\n' "  ${C_DIM}体检是只读的 —— 刚才没有改动这台机器上的任何东西。${C_RST}"
+
+	# 有 N 项问题就退 1，干净才退 0。
+	# 以前这里什么都不返回，于是 `--check` 恒退 0 —— 用户拿到「有 1 项需要先处理」
+	# 却看到一个成功的退出码，`if ./deploy.sh --check; then` 会当体检通过。
+	# 为什么不 `return "$problems"`：bash 的返回值是 uint8，计数一过 255 就被截断
+	# （256 → 0），那正好把「有一堆问题」翻成「没问题」—— 与本条修复的方向相反。
+	# 退出码这一层只需要「有没有问题」，条数在结论行里已经写清楚了。
+	if [ "$problems" -gt 0 ]; then
+		return 1
+	fi
+	return 0
 }
 
 # ---------------- 重载 / 升级 ----------------
@@ -3024,7 +3140,10 @@ main() {
 		if ! validate_path_value "$WEB_ROOT"; then
 			die "--web-root 不合法: ${WEB_ROOT}（不能含空格、引号、换行等字符）"
 		fi
-		do_check
+		# 显式传播 do_check 的裁决，不依赖 set -e 的隐式行为：
+		# 体检发现问题（problems > 0）时 --check 必须退非 0，否则「有问题」
+		# 和「没问题」在退出码上分不开，脚本化的调用方会把体检当通过。
+		do_check || return 1
 		return 0
 	fi
 
@@ -3190,7 +3309,7 @@ self_test_subset_missing_errors() {
 # 行为级：子集必须「只跑命中的区段」——不多跑。这条是给「过滤静默失效」上的锁。
 # 报数行（命中 N / 共 M、另有 K 条被过滤）是 awk 单独扫出来的，跟实际执行无关：
 # 过滤整个坏掉时它照样印得漂漂亮亮。所以只能看行为——数真跑出来的区段标题：
-# 过滤在，跑「密码生成」只会印 [2] 一个区段；过滤没了（证伪实验①），19 个区段全印。
+# 过滤在，跑「密码生成」只会印 [2] 一个区段；过滤没了（证伪实验①），20 个区段全印。
 # 不用「PASS 条数 ≤ 报数」比：报数自身对 [2] 少算一条（既有实现的老毛病，本任务不动），
 # 拿它当基准会把一条正确的实现判红。
 self_test_subset_isolates_sections() {
@@ -3219,6 +3338,26 @@ self_test_subset_isolates_sections() {
 			"$nsec" "$total" >&2
 		printf '  实际跑到的区段：\n%s\n' \
 			"$(printf '%s' "$out" | grep -E '^\[[0-9]+\] ' | sed 's/^/    /')" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级：子集扫描器必须认得 `rc_case` 断言行。
+# 认不得的坏法不会报错 —— 子集模式会把以 rc_case 写的断言整条漏掉，
+# 报数行里「共 N 条」也跟着少算，看上去一切正常。所以拿真子进程验证：
+# 用一个只出现在 rc_case 断言名里的关键词去跑子集，必须命中 ≥1 条。
+# （命中 0 条时脚本自己会报「没有任何断言匹配」并非 0 退出 —— 正好被这里逮住。）
+rc_case_subset_scan_counts() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	out=$(AMIA_ST_NESTED=1 bash "$0" --self-test "rc_case 自证" 2>&1) || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf '  子集扫描器没认出 rc_case 断言行（退出 %s）。输出：\n%s\n' "$rc" "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q 'rc_case 自证'; then
+		printf '  子集没跑到 rc_case 自证断言。输出：\n%s\n' "$out" >&2
 		return 1
 	fi
 	return 0
@@ -3360,6 +3499,267 @@ _verify_exit_sandbox() { # <main 调用体> —— 在剥掉 main "$@" 的副本
 # 桩写两遍就有漂移风险，而这里漂移了会让某条断言悄悄测不到真东西。
 _verify_exit_rc() { # <main 调用体>
 	_verify_exit_sandbox "$1" | sed -n 's/.*__RC__//p' | tail -1
+}
+
+# ---------------- do_check 的沙箱（退出码判定专用） ----------------
+# 报错两行：第一行是调用方的 <期望>，第二行是「实得」。分开是因为调用方要贴的
+# 期望值往往自带括号说明，全塞进一行读起来糊成一团。
+_ck_report() { # <函数名> <期望> <实得>
+	local fn="$1" want="$2" got="$3"
+	printf '  期望 %s。实得: %s\n' "$want" "${got:-（读不到退出码）}" >&2
+	return 1
+}
+
+# 剥掉尾部的 `main "$@"` 后 source，再由调用方自己调 main —— 与
+# _verify_exit_sandbox 同源，只是桩集不一样：do_check 是只读体检，不吃 root、
+# 不碰磁盘，真正会跟机器较劲的只有「网络 / 端口 / 磁盘」三类探测。
+#
+# 三个探测一律桩掉（这是本批次最要紧的约束）：
+#   · port_state     —— 本机没有 ss、ubuntu CI 有、alpine CI 没有。断言如果有
+#                       一次真的读到宿主环境，就会变成「ubuntu 绿、Alpine 红」。
+#                       桩成 free 之后，判据完全由断言自己给定。
+#                       注意桩【要真实】：早先我把 need_cmd 也桩成失败，本意是
+#                       模拟「没有 ss」，结果 do_check 根本没走到 `! need_cmd ss`
+#                       那条分支（port_state 整个被桩掉了），三态逻辑一次都没测到。
+#                       现在桩只覆盖三态取值，端口判定仍由真实 port_state 决定；
+#                       要测「没 ss」就在 $call 里 `unset -f port_state`（见
+#                       check_problems_unknown_when_ss_missing）。
+#   · get_public_ip / resolve_domain_ip —— 真联网有超时、有 DNS 缓存、有
+#                       代理干扰；桩成同一个 IP 才好断言「解析正确」。
+#   · curl           —— 源码里是裸调 `curl`（不是 need_cmd curl，也不是变量
+#                       转调），所以直接定义同名函数就能盖住。
+#   · df             —— 直接在提示符上跑，主机磁盘大小会决定「够不够 200MB」，
+#                       不桩掉这条断言就绑死在 CI runner 的磁盘上。
+#   · detect_os/detect_arch —— 只影响打印的那行 info，桩掉省掉读 /etc/os-release。
+#
+# 刻意【不】桩 check_tls_cert_inputs / validate_cert_options / report_cert_plan：
+# 那三个是 do_check 的真身逻辑（证书配对、cert-mode 取值、续期机制判定），
+# 桩掉就等于不测了。它们在沙箱里都是只读的，能真跑。
+#
+# 只剥尾部那行 `main "$@"`，与 _verify_exit_sandbox 一致：source 只定义函数不执行，
+# 退出码由调用方自己调 main 拿。self_test 虽然也被一并 source 进来，但沙箱走的是
+# `main --check` 这条路径，碰不到它，不存在自检套自检的问题。
+_do_check_sandbox() { # <main 调用体> —— 打印 "__RC__<退出码>" + 一行体检结论
+	local call="$1" lib="" out="" rc=0
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		detect_os()   { OS_NAME="test-os"; INIT="systemd"; PKG="apt"; return 0; }
+		detect_arch() { ARCH="x86_64"; return 0; }
+		get_public_ip()     { printf "%s" "${STUB_IP:-1.2.3.4}"; return 0; }
+		resolve_domain_ip() { printf "%s" "${STUB_IP:-1.2.3.4}"; return 0; }
+		# 注意 ${STUB_PORT_STATE:-free}：调用方用环境变量就能改三态，
+		# set -u 下必须有默认值，否则未设就是「未定义变量」直接报错。
+		# 这是【默认】桩：要跑真实的三态判定，调用方 `unset -f port_state` 即可。
+		port_state() { printf "%s" "${STUB_PORT_STATE:-free}"; return 0; }
+		need_cmd() { return 0; }
+		curl() { return 0; }
+		df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 100000000 1 99999999 1%% /\n"; return 0; }
+		trap - EXIT
+		rc=0
+		eval "$2" || rc=$?
+		printf "__RC__%s\n" "$rc"
+	' _ "$lib" "$call" 2>&1) || rc=$?
+	rm -f "$lib"
+	if [ "$rc" -eq 97 ]; then
+		printf '  子 shell 里 source 主脚本失败（脚本自身有问题）\n' >&2
+		return 1
+	fi
+	# 子 shell 自带一个 rc：source 失败才是 97，其余非 0 都被 `|| rc=$?` 吃掉了。
+	# 这里只把 stdout 原样交给调用方 —— 里面已经带 __RC__ 行。
+	printf '%s\n' "$out"
+	return 0
+}
+
+# 只要退出码的那一层（与 _verify_exit_rc 同构）。
+_do_check_rc() { # <main 调用体>
+	_do_check_sandbox "$1" | sed -n 's/.*__RC__//p' | tail -1
+}
+
+# ---- 行为级：--check 的退出码必须跟着「有没有问题」走 ----
+# 这条是本批次 A2 的核心。原来 do_check 走到底什么都不返回，于是
+# `--check` 恒退 0 —— 用户拿到「有 1 项需要先处理」，脚本化的调用方却当体检通过。
+# 必须真跑出那个数字：源码里写了 return 1 不等于真退 1（本项目反复踩过）。
+
+# A2-a) 有确定的问题时退 1。
+# 只造一个问题、其余全桩成健康：这样退出码的成因是唯一的，
+# 断言红了直接就知道是哪一项在拖后腿。
+# 走桩而不是走真实环境：本机没有 ss，真实环境里 80/443 两条会自动变成问题，
+# 那样这条断言在新机器上（有 ss）会变成 0 项问题 → 退 0 → 假红。
+check_exits_1_when_problems() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	# 期望里写清场景：DNS 指向别的机器，且注明端口已桩成空闲 ——
+	# 否则看到「实得 0」的人会以为是端口没查出来。
+	_ck_report check_exits_1_when_problems '有 1 项（域名解析不符，端口已桩成空闲）时退出 1' "$got"
+	printf '  体检结论行：%s\n' "$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)" >&2
+	return 1
+}
+
+# A2-b) 干净环境必须退 0 —— 护栏，专防「一刀切退 1」。
+# 没有这条，把 do_check 改成无条件 `return 1` 也能让上面那条绿。
+# 这里六类探测全部给健康值，问题数必须是 0。
+check_exits_0_when_clean() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	_ck_report check_exits_0_when_clean '干净环境（解析相符 / 端口空闲 / GitHub 通 / 磁盘足 / 非 root）退出 0' "$got"
+	printf '  体检结论行：%s\n' "$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)" >&2
+	return 1
+}
+
+# A2-c) 判据必须真的是「problems 计数」，不是「端口能不能查」。
+# 这一条是 B1.2（G）的行为级复核：同一台机器，唯一变量是 port_state 的三态。
+#   free  → 端口不算问题
+#   in-use（占用者不是 caddy）→ 算 3 条问题（80/443 + 自定义端口各一条）
+# 若有人把 G 改回去（unknown 只 note 不计 problems），上面的 0 仍然成立、
+# 这条也仍然成立 —— 所以还要有 check_problems_unknown_when_ss_missing 兜底。
+# 两条合起来才把「三态 → 计数 → 退出码」这条链锁死。
+check_problems_track_port_state() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		STUB_PORT_STATE=in-use
+		port_owner_is_caddy() { return 1; }
+		show_port_owner() { return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	_ck_report check_problems_track_port_state '端口被占（占用者不是 caddy）时退出 1' "$got"
+	return 1
+}
+
+# G-a) 行为级：ss 缺失时「查不了」必须计入 problems。
+# 桩掉 need_cmd 让 `need_cmd ss` 失败 —— port_state 于是返回 unknown。
+# 这是本机（无 ss）与 alpine CI（无 iproute2）的真实情形。
+# 期望必须是 1：原先 unknown 只 note 一行，problems 是 0，于是退 0 并打出
+# 「没发现问题，可以正式部署了」—— 而那台机器连 80/443 被谁占着都不知道。
+check_problems_unknown_when_ss_missing() {
+	_self_test_nested_skip && return 0
+	local out="" got="" verdict=""
+	# shellcheck disable=SC2016  # 子 shell 里刻意用单引号延迟展开 $1
+	out=$(_do_check_sandbox '
+		# 把默认的 port_state 桩撤掉，让真实的 port_state 来判断；
+		# 再让 need_cmd ss 失败 —— 于是真实 port_state 返回 unknown。
+		# 这才真的走到了 do_check 的 *) 分支（第一版把 need_cmd 桩成失败
+		# 但同时留着 port_state 桩，三态逻辑一次都没测到）。
+		unset -f port_state
+		need_cmd() { case "$1" in ss) return 1 ;; *) return 0 ;; esac; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	verdict=$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	_ck_report check_problems_unknown_when_ss_missing 'ss 缺失（端口判不出）时退出 1，不是 0' "$got"
+	printf '  体检结论行：%s\n' "${verdict:-（没读到结论行）}" >&2
+	return 1
+}
+
+# G-b) 结构级：do_check 的端口 *) 分支必须真的把 problems 加上去。
+# 为什么还要结构断言 —— 上面的行为断言桩掉了 need_cmd，只覆盖「need_cmd 失败」
+# 这一条路径；而 `case "$(port_state "$p")"` 还有别的落进 *) 的方式
+# （比如 port_state 返回了第四种值）。结构断言盯的是源码里那一行本身：
+# 少了 `problems=`，任何人把 G 改回去都立刻红。
+# 用 fn_code（剥注释）：「这里必须 problems++」这句解释性注释不算数 ——
+# 否则把真代码删掉、注释留着，断言依然绿（本项目实测过这种假绿）。
+check_ports_branch_has_problems() {
+	local body=""
+	# sed 取从 `*)` 到 `;;` 的那一段：端口循环里 in-use 分支的内层也用了
+	# `;;`，所以用非贪婪的首次匹配，取到的就是 *) 分支本体。
+	# awk 更贴切：按 case 分支缩进取。这里用 sed 的地址范围，
+	# 因为确实存在跨行的 `;;` 边界（实测：端口循环的 *) 有一行注释 + warn + note + problems++）。
+	body=$(fn_code do_check | awk '
+		/^[[:space:]]*\*\)[[:space:]]*$/ { grab = 1 }
+		grab { print }
+		grab && /^[[:space:]]*;;[[:space:]]*$/ { exit }
+	')
+	if printf '%s' "$body" | grep -qE 'problems='; then
+		return 0
+	fi
+	printf '  do_check 的端口 *) 分支里没有 problems= —— unknown 又被当成「没问题」了。\n' >&2
+	printf '  该分支实际内容：\n%s\n' "$body" >&2
+	return 1
+}
+
+# G-c) 结构级：check_ports_free 的 *) 分支必须与同函数里「端口被占」那个分支同格。
+# 两处口径必须一致，否则同一台机器上 preflight 与 --check 会给出不同裁决：
+# --check 说「有问题」，preflight 却一声不响地放过去。
+# 断言必须绑在「结构」而不是「恰好有 confirm 这个词」上 ——
+# confirm 必须出现在 *) 分支里，且必须受 ASSUME_YES 管辖。
+check_preflight_ports_branch_guarded() {
+	local body=""
+	body=$(fn_code check_ports_free | awk '
+		/^[[:space:]]*\*\)[[:space:]]*$/ { grab = 1 }
+		grab { print }
+		grab && /^[[:space:]]*;;[[:space:]]*$/ { exit }
+	')
+	if ! printf '%s' "$body" | grep -qE 'ASSUME_YES'; then
+		printf '  check_ports_free 的端口 *) 分支没受 ASSUME_YES 管辖 —— 无人值守部署会被卡住。\n' >&2
+		printf '  该分支实际内容：\n%s\n' "$body" >&2
+		return 1
+	fi
+	if ! printf '%s' "$body" | grep -qE 'confirm[[:space:]]'; then
+		printf '  check_ports_free 的端口 *) 分支没有 confirm —— 「查不了」又被 note 一行放过了。\n' >&2
+		printf '  该分支实际内容：\n%s\n' "$body" >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---- 只读性：--check 有问题时改的也只是退出码，不是这台机器 ----
+# 与 [11] 里那条「--check 无需 root 即可完成」是同一件事的两面：
+# 那边断「跑得完」，这边断「发现问题也没退化成跑不完」。
+check_problems_still_completes_readonly() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	# 取的是沙箱里 main 的真实退出码（stdout 的 __RC__ 行），不是
+	# `$(...)` 这个命令替换本身的 rc —— 后者恒为 0，拿它跟 126/127 比
+	# 永远不成立，等于这条保护是空的（第一版就是这么写错的）。
+	rc=$(_do_check_rc '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	# 126 = 命令不可执行、127 = 找不到命令：这两个码说明 --check 在沙箱里
+	# 连体检都没跑起来（例如脚本被改成需要 root 才能执行）。
+	# 退 1 是「体检发现问题」，不是「跑不动」—— 这两者必须分得开。
+	if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+		printf '  --check 在沙箱里没能跑起来（退出码 %s，像是指令找不到/不可执行）。\n' "$rc" >&2
+		return 1
+	fi
+	# 结论行必须打出来：有问题也要走完整个体检，而不是撞到第一项就退出。
+	# 这里重跑一次沙箱只取输出 —— 与上面那次共用同一组桩，判据一致。
+	out=$(_do_check_sandbox '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	if ! printf '%s' "$out" | grep -qE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理'; then
+		printf '  --check 有问题时没打出结论行 —— 体检中途退出了？\n' >&2
+		return 1
+	fi
+	return 0
 }
 
 # 行为级：部署完成但验证有 warning 时，main 的退出码必须是 2（不是 0）。
@@ -3647,6 +4047,622 @@ self_test_report() {
 	return 0
 }
 
+# ============================================================================
+# BATCH B2 的行为级辅助（F3 / F1 / F2 / F4）
+#
+# 共同点：都真起子进程跑被测函数，看它实际返回什么 / 打印什么 / 退出码是多少。
+# 不靠字符串匹配断言「行为」—— 本项目反复踩过「断言绿、行为红」。
+# 系统依赖一律离桩（本机是 Windows Git Bash，没有 root / systemd / caddy，
+# 而且红线禁止碰真系统）。
+# ============================================================================
+
+# 结构级（F3 调用点②）：do_rotate_password 里「打印新密码」必须早于「写 client-config」。
+# 顺序反了就是红线 3：die 在打印之前触发 → 新密码已生效、服务已重载，
+# 用户却看不到密码，只能去翻 state 文件 = 被锁在门外。
+# 只比行号不看内容 —— 内容由下面那条行为断言管。
+rotate_prints_password_before_dying() {
+	_self_test_nested_skip && return 0
+	local code="" a="" b=""
+	code=$(fn_code do_rotate_password) || return 1
+	a=$(printf '%s\n' "$code" | grep -n 'info "  新密码' | head -1 | cut -d: -f1)
+	b=$(printf '%s\n' "$code" | grep -n 'render_client_config' | head -1 | cut -d: -f1)
+	if [ -z "$a" ] || [ -z "$b" ]; then
+		printf '  在 do_rotate_password 里找不到「打印新密码」(行 %s) 或「写 client-config」(行 %s)\n' \
+			"${a:-无}" "${b:-无}" >&2
+		return 1
+	fi
+	if [ "$a" -ge "$b" ]; then
+		printf '  「打印新密码」在第 %s 行、「写 client-config」在第 %s 行 —— 顺序反了。\n' "$a" "$b" >&2
+		printf '  写失败时 die 会先终止脚本，用户拿不到新密码（而密码此时已经生效）= 被锁在门外。\n' >&2
+		return 1
+	fi
+	return 0
+}
+
+# 结构级（F3 调用点②）：写失败那一处必须挂 `|| die`。
+# 单独一条（不并进上面那条顺序断言）是为了让失败原因唯一可读。
+# 为什么必须是 die 而不是 verify_warn：main 里是
+# `if [ "$ROTATE_PASSWORD" = yes ]; then do_rotate_password; return 0; fi` ——
+# 那个 return 0 无条件弃掉退出码，verify_warn 只会加计数器、退出码照样 0，
+# 等于换个地方假绿。而只删掉 `|| true` 不挂 `|| die` 也不行：
+# set -Eeuo pipefail 下裸重定向失败会当场终止脚本、绕过自己的文案。
+rotate_write_is_failure_ized() {
+	_self_test_nested_skip && return 0
+	local code="" b="" seg=""
+	code=$(fn_code do_rotate_password) || return 1
+	b=$(printf '%s\n' "$code" | grep -n 'render_client_config' | head -1 | cut -d: -f1)
+	if [ -z "$b" ]; then
+		printf '  在 do_rotate_password 里找不到写 client-config 的那一行\n' >&2
+		return 1
+	fi
+	# 可能写成续行（`> file \` 换行 `|| die`），所以这一行连同下一行一起看
+	seg=$(printf '%s\n' "$code" | sed -n "$((b)),$((b + 1))p")
+	if printf '%s' "$seg" | grep -q '||[[:space:]]*die'; then
+		return 0
+	fi
+	printf '  写 client-config 那一处没挂「|| die」（第 %s 行起）—— 用 verify_warn 会静默失效\n' "$b" >&2
+	printf '  （main 的「return 0」弃掉退出码），裸写则会被 set -e 当场终止、绕过文案：\n%s\n' "$seg" >&2
+	return 1
+}
+
+# 行为级（F3 调用点①）：CREDS_KNOWN=yes 且 CLIENT_CONF 指向不可写路径时，
+# print_summary 必须 ① 计入 VERIFY_WARNINGS（→ main 末尾退 2）
+# ② 不再广告「已存到 X，权限 0600」。
+# 两件事分开断：只断计数会漏掉「计数对了、广告照旧」的假绿 —— 那正是原 bug 的样子。
+summary_warns_when_client_conf_unwritable() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" warns=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		DOMAIN="a.example.com"; HTTPS_PORT="443"
+		NAIVE_USER="naive"; NAIVE_PASS="Aa12345678"
+		CREDS_KNOWN="yes"; CLIENT_PROTO="https"
+		CERT_MODE_KNOWN="no"; PROBE_SECRET=""; PAC_PATH=""
+		# 父目录不存在 —— 重定向必然失败，正是要测的那条路
+		CLIENT_CONF="$2/nowrite/client-config.json"
+		VERIFY_WARNINGS=0; VERIFY_NOTES=()
+		print_summary
+		printf "__WARNS__%s\n" "$VERIFY_WARNINGS"
+	' _ "$lib" "$tdir" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	warns=$(printf '%s' "$out" | sed -n 's/.*__WARNS__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${warns:-0}" -lt 1 ] 2>/dev/null; then
+		printf '  写不成 client-config 时没有计入 VERIFY_WARNINGS（实得 %s）—— 静默失败，退出码会是 0\n' \
+			"${warns:-（读不到）}" >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if grep -q '已存到' <<< "$out"; then
+		printf '  文件没写成，摘要却照广告「已存到 X，权限 0600」—— 假信息\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级（F3 调用点②）：换密码时 CLIENT_CONF 不可写 → 必须【非 0 退出】，
+# 且【新密码已经打印出来】。
+# 为什么必须两件事一起断：只断退出码，用 verify_warn 的写法也能绿（计数器加了、
+# 退出码仍是 0 —— 换个地方假绿）；只断「打印了密码」，把 die 挪到打印之前也能绿
+# （用户被锁在门外）。这两条合起来才是 F3 调用点② 的完整契约。
+rotate_dies_after_printing_password() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" rc="" stdout_only="" pass="B2NewPass98765432"
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	# 2>/dev/null：把子 shell 自己的杂音（重定向失败的报错等）丢掉，
+	# 只看 __RC__ 与 stdout 段 —— 断的是「stdout 里有没有新密码」。
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		DOMAIN="a.example.com"; EMAIL="o@m.test"
+		HTTPS_PORT="443"; ALLOW_PORTS=""; PROBE_SECRET=""; PAC_PATH=""
+		CLIENT_PROTO="https"; TLS_CERT_FILE=""; TLS_KEY_FILE=""
+		CERT_MODE_ACTUAL="caddy"; INIT="systemd"
+		CONF_FILE="$2/caddy.conf"; : > "${CONF_FILE}"
+		STATE_FILE="$2/state"; : > "${STATE_FILE}"
+		CADDY_BIN="$2/caddy-stub"
+		printf "#!/bin/sh\nexit 0\n" > "${CADDY_BIN}"; chmod +x "${CADDY_BIN}"
+		# 父目录不存在 —— 写 client-config 必然失败
+		CLIENT_CONF="$2/nowrite/client-config.json"
+		B2_NEWPASS="$3"
+		# 系统依赖全部离桩：本机没有 root / caddy / systemctl（红线：不碰真系统）
+		state_load()     { return 0; }
+		state_write()    { return 0; }
+		render_caddyfile() { printf "stub\n"; }
+		gen_password()   { printf "%s\n" "$B2_NEWPASS"; }
+		chown()          { return 0; }
+		systemctl()      { return 0; }
+		rc-service()     { return 0; }
+		# do_rotate_password 里的 die 是 exit 1 —— 放进子 shell 才拦得住，
+		# 否则 `|| rc=$?` 与后面的 printf 都跑不到。
+		rc=0
+		( do_rotate_password >"$2/out.txt" 2>"$2/err.txt" ) || rc=$?
+		printf "__RC__%s\n" "$rc"
+		printf "__OUT_BEGIN__\n"
+		cat "$2/out.txt"
+		printf "__OUT_END__\n"
+	' _ "$lib" "$tdir" "$pass" 2>/dev/null)
+	rm -f "$lib"; rm -rf "$tdir"
+	rc=$(printf '%s' "$out" | sed -n 's/^__RC__//p' | tail -1)
+	stdout_only=$(printf '%s\n' "$out" | sed -n '/^__OUT_BEGIN__$/,/^__OUT_END__$/p')
+	if [ "${rc:-0}" = "0" ] || [ -z "$rc" ]; then
+		printf '  换密码时写不成 client-config，脚本却退出 0（实得 %s）—— 静默失败。\n' "${rc:-（读不到）}" >&2
+		printf '  main 里是「do_rotate_password; return 0」，所以这里只能用 die 而不能用 verify_warn。\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if ! grep -qF -- "$pass" <<< "$stdout_only"; then
+		printf '  非 0 退出了，但新密码没打印到 stdout —— 密码已经生效、服务已重载，\n' >&2
+		printf '  用户却被锁在门外（红线 3）。stdout 段：\n%s\n' "$stdout_only" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级（F1/F2）：开机自启设不上时，install_service 必须
+# ① 仍然返回 0（不能 return 1 —— 那会经 run_stage 的 exit 1 跳过 print_summary，
+#    用户拿不到密码 = 假失败）② 把这件事计入 VERIFY_WARNINGS（否则「不吞」只是文案）。
+# 一次跑出两个读数，避免把同一个沙箱写两遍（写两遍就有漂移风险）。
+install_service_selfstart_failure() { # <systemd|openrc> —— 只打印 "__RC__<码> WARNS__<数>"
+	local init="$1" lib="" tdir="" out=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		INIT="$3"
+		CERT_MODE_ACTUAL="caddy"        # 不走 acme 续期分支
+		SVC_FILE="$2/caddy.service"; OPENRC_FILE="$2/caddy.openrc"
+		VERIFY_WARNINGS=0; VERIFY_NOTES=()
+		# 依赖全部离桩：本机没有 systemd / openrc，也不该去动真系统
+		ensure_cert_readable()   { return 0; }
+		ensure_log_dir_owner()   { return 0; }
+		backup_if_exists()       { return 0; }
+		render_systemd_unit()    { printf "stub\n"; }
+		render_openrc_script()   { printf "stub\n"; }
+		install_renewal()        { return 0; }
+		mkdir()                  { return 0; }
+		chmod()                  { return 0; }
+		systemctl() {
+			# enable 失败 —— 这就是注入的故障；其余子命令一律成功
+			case "$1" in enable) return 1 ;; esac
+			return 0
+		}
+		rc-service()  { return 0; }
+		rc-update()   { return 1; }     # openrc 支的 enable 等价物：同样失败
+		rc=0
+		install_service >/dev/null 2>&1 || rc=$?
+		printf "__RC__%s WARNS__%s\n" "$rc" "$VERIFY_WARNINGS"
+	' _ "$lib" "$tdir" "$init" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	printf '%s\n' "$out"
+}
+
+install_service_selfstart_warns_not_fails() { # <systemd|openrc>
+	local out="" rc="" warns=""
+	out=$(install_service_selfstart_failure "$1") || return 1
+	rc=$(printf '%s' "$out" | sed -n 's/.*__RC__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${rc:-x}" = "0" ]; then
+		return 0
+	fi
+	printf '  %s 支：自启设不上时 install_service 返回 %s（期望 0）。\n' "$1" "${rc:-（读不到）}" >&2
+	printf '  返回非 0 会经 run_stage 的 exit 1 跳过 print_summary —— 用户拿不到密码（假失败）。\n' >&2
+	printf '  原始输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+install_service_selfstart_counts_warning() { # <systemd|openrc>
+	local out="" warns=""
+	out=$(install_service_selfstart_failure "$1") || return 1
+	warns=$(printf '%s' "$out" | sed -n 's/.*WARNS__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${warns:-0}" -ge 1 ] 2>/dev/null; then
+		return 0
+	fi
+	printf '  %s 支：自启设不上却只记了 %s 条警告 —— 失败又被吞了（退出码会停在 0）。\n' \
+		"$1" "${warns:-（读不到）}" >&2
+	printf '  原始输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+# 结构级（F4）：无 digest 分支必须设跨阶段标志，且设的是「没校验」那一支。
+# 只断「函数里出现过标志名」不够 —— 设在「校验通过」那一支上会让摘要
+# 谎报「本次没校验」，方向正好反过来的假信息。
+caddy_digest_flag_set_in_no_digest_branch() {
+	_self_test_nested_skip && return 0
+	local code="" prev=""
+	code=$(fn_code install_caddy_binary) || return 1
+	prev=$(printf '%s\n' "$code" | awk '
+		/^[[:space:]]*CADDY_DIGEST_MISSING="yes"[[:space:]]*$/ { print prev; exit }
+		{ prev = $0 }
+	')
+	if [ -z "$prev" ]; then
+		printf '  install_caddy_binary 里没有设 CADDY_DIGEST_MISSING="yes" 的那一行\n' >&2
+		return 1
+	fi
+	prev=$(printf '%s' "$prev" | tr -d '[:space:]')
+	if [ "$prev" = "else" ]; then
+		return 0
+	fi
+	printf '  设 CADDY_DIGEST_MISSING="yes" 的那一行前面是「%s」而不是 else ——\n' "$prev" >&2
+	printf '  标志可能被设在了「校验通过」那一支上，那会让摘要谎报「本次没做校验」。\n' >&2
+	return 1
+}
+
+# 行为级（F4）：上游没提供校验和时，main 的退出码必须【仍是 0】。
+# 理由：给不给 digest 是上游行为，用户在本机修不了；记成 verify_warn 会让
+# 每次部署都退 2 = 假失败。上游侧由 upstream-drift.yml 每日守门。
+main_exits_0_when_digest_missing() {
+	_self_test_nested_skip && return 0
+	local got=""
+	got=$(_verify_exit_rc '
+		install_caddy_binary() { CADDY_DIGEST_MISSING="yes"; return 0; }
+		main --domain a.example.com --email o@m.test
+	')
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	printf '  期望「上游没给校验和」时 main 仍退出 0。实得: %s\n' "${got:-（读不到退出码）}" >&2
+	printf '  非 0 = 有人把它接进 verify_warn 了 —— 那会让每次部署都退 2（假失败）。\n' >&2
+	return 1
+}
+
+# 行为级（F4）：真的跑一遍 install_caddy_binary 的无 digest 分支 ——
+# 返回 0 且把状态记下来。只断源码里写了标志名挡不住「分支根本没走到」。
+install_caddy_binary_no_digest_ok() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" rc="" flag=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		BUILD_FROM_SRC="no"; ARCH="x86_64"
+		CADDY_BIN="$2/caddy"
+		DEPLOY_LOG="$2/deploy.log"
+		# 上游没提供校验和 —— 这正是要测的那条路
+		resolve_caddy_tag()    { printf "v0.0.0-b2\n"; }
+		resolve_caddy_digest() { return 1; }
+		setup_deploy_log()     { return 0; }
+		show_log_tail()        { return 0; }
+		# curl / tar / find / install / mv 全部离桩：本机不联网、不碰真系统
+		curl() { local f=""; while [ $# -gt 0 ]; do case "$1" in -o) f="$2"; shift 2 ;; *) shift ;; esac; done; [ -n "$f" ] && : > "$f"; return 0; }
+		tar()  { local d=""; while [ $# -gt 0 ]; do case "$1" in -C) d="$2"; shift 2 ;; *) shift ;; esac; done; [ -n "$d" ] && : > "$d/caddy"; return 0; }
+		find()    { printf "%s/caddy\n" "$1"; }
+		install() { return 0; }
+		mv()      { return 0; }
+		need_cmd() { return 1; }        # 跳过 setcap 那一支
+		rc=0
+		install_caddy_binary >/dev/null 2>&1 || rc=$?
+		printf "__RC__%s FLAG__%s\n" "$rc" "${CADDY_DIGEST_MISSING}"
+	' _ "$lib" "$tdir" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	rc=$(printf '%s' "$out" | sed -n 's/.*__RC__\([0-9]*\).*/\1/p' | tail -1)
+	flag=$(printf '%s' "$out" | sed -n 's/.*FLAG__\([a-z]*\).*/\1/p' | tail -1)
+	if [ "${rc:-x}" != "0" ]; then
+		printf '  无 digest 时 install_caddy_binary 返回 %s（期望 0）—— 上游行为不该让本机部署失败\n' \
+			"${rc:-（读不到）}" >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if [ "$flag" != "yes" ]; then
+		printf '  无 digest 分支走过了，但 CADDY_DIGEST_MISSING=%s（期望 yes）—— 摘要回显不出来\n' \
+			"${flag:-（读不到）}" >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---------------- A（非 TTY Default-Deny）的沙箱 ----------------
+# 剥掉尾部 `main "$@"` 后 source，再由调用方真跑一次 main —— 与
+# _verify_exit_sandbox / _do_check_sandbox 同源（三处桩集各异，是为了让每条断言
+# 只依赖它真需要的东西；混用一套会让桩越来越"全能"，最后没人知道哪条断言靠什么）。
+#
+# 与 _verify_exit_sandbox 的关键差别只有一个，但这个差别就是本批次的核心：
+#   **它【不】把 preflight 桩掉**，也【不】桩掉那三个 check_*。
+# _verify_exit_sandbox 一句 `preflight() { return 0; }` 就把整条预检路径抹平了，
+# 于是「preflight 真的会把失败传出去吗」在那里永远测不到 —— 只能另起一个沙箱。
+#
+# stdin 刻意接 /dev/null（非 TTY）：-t 0 因此为假，正好是要复现的那个场景；
+# 子 shell 里 `trap - EXIT` 是必要的 —— 主脚本给自己挂了 EXIT trap（cleanup），
+# 不摘掉就会在子 shell 退出时去动真系统。
+#
+# 桩的取向：所有探测类一律失败或给固定值（绝不碰真网络 / 真 DNS / 真系统），
+# 7 个阶段函数一律成功（本沙箱要验的是 main 在预检那一刻的裁决，不是部署本身）。
+# 退出码由子 shell 自己打 `__RC__<码>`，因为 _verify_exit_sandbox 那种
+# `main --domain …` 的写法在这里走不通：本沙箱的调用体是多行脚本，不是一行命令。
+# 返回：把 main 的输出写在 stdout 上，退出码写在最后一行 `__RC__<码>`。
+# 末行写法与 _verify_exit_sandbox / _do_check_sandbox 一致，便于调用方共用一个读取器。
+#
+# ⚠️ 这里【不能】用 `main "$@" || rc=$?` 这种写法去取退出码 —— 那正是本批次要修的陷阱的镜像：
+# `A || B` 会给 A 挂起 errexit，而 main 里 `--purge` 的二次确认是【裸调】（`if …; then confirm …; fi`），
+# 全靠 errexit 在拒绝时把流程打断。挂起之后它会接着往下删东西、最后 `return 0`，
+# 于是沙箱里量到的行为跟真机**正好相反**，断言会把「没拦住」判成绿。
+# 所以这里让 main 裸跑：它要是中途被 errexit 打断，子 shell 就直接退出，
+# 由外层命令替换的 `|| rc=$?` 读到那个码。
+_deploy_run() { # <在 source 之后、调 main 之前要执行的桩脚本>
+	local stubs="$1" lib="" out="" rc=0
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		# 先把两个入参收进普通变量：底下的 `set --` 会把 $1/$2 清掉（那是刻意的，
+		# 见下），之后还要 eval 跑桩脚本，不留一份就取不到了。
+		__lib="$1"; __stubs="$2"
+		source "$__lib" 2>/dev/null || exit 97
+		require_root() { return 0; }
+		validate_inputs() { return 0; }
+		# INIT 必须给死：留空的话 preflight 会在 `[ -z "$INIT" ]` 那一句就 return 1，
+		# 于是断言「退 1」会因为这个无关原因而变绿 —— 那种绿是假的。
+		detect_os() { OS_NAME="test-os"; INIT="systemd"; PKG="apt"; return 0; }
+		detect_arch() { return 0; }
+		cleanup() { return 0; }
+		gather_state() { return 0; }
+		install_deps() { return 0; }
+		install_caddy_binary() { return 0; }
+		setup_user_and_dirs() { return 0; }
+		write_config() { return 0; }
+		write_camouflage_site() { return 0; }
+		install_service() { return 0; }
+		verify_deployment() { return 0; }
+		# 端口三态不桩掉的话：本机没 ss 会走 unknown 分支 → 也是 confirm，
+		# 断言就分不清「拦住的到底是哪一个判定点」。桩成空闲把变量收干净。
+		port_state() { printf "free"; return 0; }
+		trap - EXIT
+		# 清空位置参数：`bash -c` 的 $1/$2 是临时文件名，不清掉会被当成 main 的入参。
+		# 桩脚本要传参数就自己 `set -- …`。
+		set --
+		eval "$__stubs" || true
+		main "$@"
+	' _ "$lib" "$stubs" 2>&1 </dev/null) || rc=$?
+	rm -f "$lib"
+	if [ "$rc" -eq 97 ]; then
+		printf '  子 shell 里 source 主脚本失败（脚本自身有问题）\n' >&2
+		return 1
+	fi
+	printf '%s\n__RC__%s\n' "$out" "$rc"
+	return 0
+}
+
+_deploy_rc() { # <桩脚本> —— 只要 main 的退出码
+	_deploy_run "$1" | sed -n 's/^__RC__//p' | tail -1
+}
+
+_deploy_out() { # <桩脚本> —— 只要 main 的输出（去掉末行的退出码）
+	_deploy_run "$1" | sed '/^__RC__[0-9]*$/d'
+}
+
+# ---- A-a) 🔴 本批次的核心断言 ----
+# 非 TTY + 预检里的 confirm 拒绝 ⇒ **经 main 的 `preflight || exit 1`** 必须拦住。
+#
+# 为什么非走 main 不可：只调 preflight 的话，`preflight; echo rc=$?` 拿到的是
+# preflight 自己的返回值，而 main 那次调用的形态是 `preflight || exit 1` ——
+# `A || B` 会挂起 A 内部的 errexit，且 preflight 的返回值只等于它【自己最后一条命令】
+# （`ok "预检完成"` = 0）。实测过：单改 confirm 的返回值，单独调 preflight 得到
+# rc=1（看着"修好了"），走 main 却照样 rc=0、警告照打、"预检完成"照打、部署继续。
+# 所以断言必须落在 main 上，并且额外断输出里【不出现】"预检完成" ——
+# 退出码对了但预检照跑完也是一种假修（失败没有中断它，只是最后被丢弃）。
+confirm_denies_and_main_stops() {
+	_self_test_nested_skip && return 0
+	local got="" raw="" out=""
+	# 非交互（stdin 是 /dev/null）：域名解析到别的机器 → check_domain_dns 走到
+	# `[ "$ASSUME_YES" = "yes" ] || confirm …`，confirm 因 -t 0 为假而拒绝。
+	raw=$(_deploy_run '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		set -- --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$raw" | sed -n 's/^__RC__//p' | tail -1)
+	out=$(printf '%s\n' "$raw" | sed '/^__RC__[0-9]*$/d')
+	if [ "$got" != "1" ]; then
+		printf '  期望非交互 + 域名解析不符时 main 退出 1（拦住），实得 %s\n' \
+			"${got:-（读不到）}" >&2
+		printf '  若实得 0：preflight 里的「check_* || return 1」被删了 ——\n' >&2
+		printf '  「preflight || exit 1」会挂起 errexit，失败传不出来（本批次的核心陷阱）。\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if printf '%s' "$out" | grep -q '预检完成'; then
+		printf '  拦住是拦住了（退出码 1），但预检还是跑到了底 —— 输出里有「预检完成」。\n' >&2
+		printf '  说明失败没有中断 preflight，只是最后被丢弃 —— 同样是假修。\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---- A-b) `--yes` 是唯一的显式放行 ----
+# 同一套桩、同一个警告，只多一个 --yes：必须照常退 0。
+# 没有这条，「Default-Deny」会被写成「预检有警告就一律拒绝」——
+# 那会打死 CI 夹具（harness.sh 的 DEPLOY_ARGS 末位就是 --yes）。
+confirm_allows_with_yes() {
+	_self_test_nested_skip && return 0
+	local got=""
+	got=$(_deploy_rc '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		set -- --domain a.example.com --email o@m.test --yes
+	')
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	printf '  期望 --yes + 非交互 + 有警告时 main 退出 0，实得 %s\n' "${got:-（读不到）}" >&2
+	printf '  --yes 是唯一的显式放行口；它被堵住会连带打死 CI 夹具（那条命令末位就是 --yes）。\n' >&2
+	return 1
+}
+
+# ---- A-c) 第 4 个判定点：--purge 不走预检 ----
+# do_uninstall 在 preflight 【之前】被调（卸载路径根本不走预检），
+# 所以 --purge 的二次确认是唯一不受 preflight 保护的那个判定点 ——
+# 它只能靠 confirm 自己拒绝。这里补上它的行为级覆盖。
+# 两个读数分别来自两次运行（各带 / 不带 --yes）。
+purge_needs_confirm_when_noninteractive() {
+	_self_test_nested_skip && return 0
+	local got="" got_yes=""
+	# 卸载路径不装包、不写配置，但 do_uninstall 会动 systemd / rm —— 全桩掉。
+	# 刻意【不】桩 preflight：本断言的论点就是"卸载根本不经过它"。
+	got=$(_deploy_rc '
+		systemctl() { return 0; }
+		userdel()   { return 0; }
+		rm()        { return 0; }
+		id()        { return 1; }
+		dir_has_foreign_content() { return 0; }
+		set -- --uninstall --purge
+	')
+	got_yes=$(_deploy_rc '
+		systemctl() { return 0; }
+		userdel()   { return 0; }
+		rm()        { return 0; }
+		id()        { return 1; }
+		dir_has_foreign_content() { return 0; }
+		set -- --uninstall --purge --yes
+	')
+	if [ "$got" = "0" ]; then
+		printf '  --purge + 非交互 + 无 --yes 时 main 退 0 —— 不可撤销的清理被默认放行了。\n' >&2
+		return 1
+	fi
+	if [ "$got_yes" != "0" ]; then
+		printf '  --purge + --yes 时 main 退 %s（期望 0）—— 显式放行口没生效。\n' \
+			"${got_yes:-（读不到）}" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 结构级：`[ ! -t 0 ]` 那一支里不许有 `return 0`。
+# 取的是「从 `[ ! -t 0 ]` 那一行到它配套的 fi」这一段，而不是整个函数体 ——
+# 整函数里 case 的 y/Y 分支有个合法的 `return 0`，扫整段会把它误判成 Default-Allow，
+# 断言就变成一个永远红的坏断言（比没有更糟：它会训练人忽略它）。
+confirm_noninteractive_branch_denies() {
+	local body=""
+	body=$(fn_code confirm | awk '
+		/\[ ! -t 0 \]/ { grab = 1 }
+		grab { print }
+		grab && /^[[:space:]]*fi[[:space:]]*$/ { exit }
+	')
+	if [ -z "$body" ]; then
+		printf '  confirm 里找不到「[ ! -t 0 ]」分支 —— 非交互的判定点被删了？\n' >&2
+		return 1
+	fi
+	if printf '%s' "$body" | grep -qE 'return 0'; then
+		printf '  confirm 的非交互分支里仍有「return 0」—— 这就是原来的 Default-Allow。\n' >&2
+		printf '  该分支实际内容：\n%s\n' "$body" >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---- A-d) 端口循环：失败不许被后一轮的 ok 冲掉 ----
+# 这条断言的存在理由是一个**只在循环里才会暴露**的漏洞：
+# `check_ports_free` 对 80/443 逐端口循环。若只在 preflight 那一层写
+# `check_ports_free || return 1`，而循环内 confirm 的失败没有当场 return，
+# 那么 —— 80 被占 → confirm 拒绝 → 循环【继续】→ 443 空闲 → `ok`（返回 0）
+# → 循环结束时函数的返回值是 0 → preflight 认为这一项过了 → 部署继续。
+# 实测：把循环内那两处 `|| return 1` 去掉，main 退 0 且打印「预检完成」（假绿）。
+# 所以断言必须造「一个端口被占、另一个空闲」这种局面 —— 只造一个端口的话，
+# 循环内不 return 也能因为「它是最后一轮」而侥幸拿到 1，测不出这个洞。
+port_warning_stops_main() {
+	_self_test_nested_skip && return 0
+	local raw="" got="" out=""
+	# shellcheck disable=SC2016  # 子 shell 里刻意用单引号延迟展开 $1
+	raw=$(_deploy_run '
+		# DNS 桩成健康，把变量收成「唯一触发点是端口」
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "1.2.3.4"; return 0; }
+		# 80 被别的程序占着，443 空闲 —— 顺序很重要（先失败后成功）
+		port_state() { case "$1" in 80) printf "in-use" ;; *) printf "free" ;; esac; }
+		port_owner_is_caddy() { return 1; }
+		show_port_owner()     { return 0; }
+		set -- --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$raw" | sed -n 's/^__RC__//p' | tail -1)
+	out=$(printf '%s\n' "$raw" | sed '/^__RC__[0-9]*$/d')
+	if [ "$got" != "1" ]; then
+		printf '  期望「80 被占、443 空闲」时 main 退出 1，实得 %s\n' "${got:-（读不到）}" >&2
+		printf '  实得 0 = 循环内 confirm 的失败被后一轮的 ok 冲掉了（只在循环里才暴露）。\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if printf '%s' "$out" | grep -q '预检完成'; then
+		printf '  退出码是 1，但预检跑到了底（输出含「预检完成」）—— 失败没当场中断循环。\n' >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---------------- B（check_domain_dns 两分支）的断言 ----------------
+# 结构级：两处 confirm ——「解析到别的 IP」一处、「查不到 A 记录」一处。
+# 数的是【代码行】里出现 confirm 的行数（不是词频）：两处都写成一行一个调用，
+# 词频与行数在这里等价，但行数更贴「有几个判定点」这个语义。
+domain_dns_has_two_confirms() {
+	local n=""
+	n=$(fn_code check_domain_dns | grep -c 'confirm' || true)
+	if [ "${n:-0}" -ge 2 ]; then
+		return 0
+	fi
+	printf '  check_domain_dns 里只有 %s 处 confirm（期望 ≥2）—— else 没拆开？\n' "${n:-0}" >&2
+	printf '  函数体（去注释）：\n%s\n' "$(fn_code check_domain_dns | sed 's/^/    /')" >&2
+	return 1
+}
+
+# 行为级（沙箱桩）：只调 check_domain_dns 本身，看它有没有问人。
+# 判据是「confirm 被调到」而不是输出文字 —— 有没有 confirm 是行为契约，
+# 输出的措辞随时会改，绑文字会让断言在无关的重写里假红。
+# 用 _domain_dns_probe 打桩：confirm 换成记录器，两个探测桩各给各的值。
+_domain_dns_probe() { # <get_public_ip 的行为> <resolve_domain_ip 的行为> —— 打印 "CONFIRMS__<次数>"
+	local gpip="$1" rdip="$2" lib="" out=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		# 桩脚本必须先收进变量：函数体里的 $2/$3 是【函数自己的】位置参数，
+		# 不是外层脚本的 —— 直接在函数体里写 eval "$2" 会取到空值（set -u 下直接报错）。
+		__lib="$1"; __gpip="$2"; __rdip="$3"
+		source "$__lib" 2>/dev/null || exit 97
+		DOMAIN="a.example.com"; ASSUME_YES="no"
+		CONFIRMS=0
+		confirm() { CONFIRMS=$((CONFIRMS + 1)); return 1; }
+		get_public_ip()     { eval "$__gpip"; }
+		resolve_domain_ip() { eval "$__rdip"; }
+		check_domain_dns >/dev/null 2>&1 || true
+		printf "CONFIRMS__%s\n" "$CONFIRMS"
+	' _ "$lib" "$gpip" "$rdip" 2>&1) || true
+	rm -f "$lib"
+	printf '%s\n' "$out" | sed -n 's/.*CONFIRMS__//p' | tail -1
+}
+
+# (c) 域名真查不到 A 记录 → 必须问人（与「解析到别的 IP」对齐）。
+b_dns_missing_asks() {
+	_self_test_nested_skip && return 0
+	local n=""
+	n=$(_domain_dns_probe 'printf "%s" "1.2.3.4"; return 0' 'printf ""; return 1')
+	if [ "${n:-0}" -ge 1 ]; then
+		return 0
+	fi
+	printf '  域名查不到 A 记录时没问人（confirm 被调 %s 次）—— 这一支又被无声放过了。\n' "${n:-（读不到）}" >&2
+	return 1
+}
+
+# (d) 本机公网 IP 拿不到（域名解析反而是好的）→ 只警告，不问人。
+# 理由：get_public_ip 依赖外部 IP 服务，任一不可达就返回 1 ——
+# 这时判定不可靠，问人是噪音。
+b_public_ip_missing_does_not_ask() {
+	_self_test_nested_skip && return 0
+	local n="" rc=0
+	n=$(_domain_dns_probe 'return 1' 'printf "%s" "9.9.9.9"; return 0')
+	# 读不到读数（沙箱本身坏了）也算失败，不能默认成 0 蒙过去。
+	if [ -z "$n" ]; then
+		printf '  读不到沙箱读数 —— 桩没跑起来，这条断言等于没测。\n' >&2
+		return 1
+	fi
+	if [ "$n" = "0" ]; then
+		return 0
+	fi
+	printf '  本机公网 IP 拿不到时问了人（confirm 被调 %s 次）—— 判定不可靠时问人是噪音，\n' "$n" >&2
+	printf '  而且会把「外部 IP 服务不通」变成一次无人值守下的硬停。\n' >&2
+	return 1
+}
 
 self_test() {
 	local pass=0 fail=0 skip=0 rc=0
@@ -3678,6 +4694,20 @@ self_test() {
 		fi
 	}
 
+	# 把「期望退出码 == N」变成一等断言。true_case 只断「为 0」、false_case 只断
+	# 「非 0」，都表达不了「恰好退 2」这种三档语义 —— 只能用不等号近似，而那正是
+	# 本项目最怕的「看起来精确」的假绿。参数：<名称> <期望码> <命令...>。
+	# 取值来源是子进程真实退出码（不是字符串匹配），与本文件其余行为级断言同源。
+	rc_case() {
+		local name="$1" want="$2" got=0; shift 2
+		"$@" >/dev/null 2>&1 || got=$?
+		if [ "$got" = "$want" ]; then
+			printf '  %sPASS%s %s\n' "$C_GRN" "$C_RST" "$name"; pass=$((pass + 1))
+		else
+			printf '  %sFAIL%s %s（期望退出码 %s，实得 %s）\n' "$C_RED" "$C_RST" "$name" "$want" "$got"; fail=$((fail + 1))
+		fi
+	}
+
 	# 用 <<< 而不是管道：大输入 + 匹配在开头时 grep 会提前退出，
 # 管道写法在 set -o pipefail 下会让「匹配成功」也返回 141（SIGPIPE）——
 # 表现为断言偶发假失败。herestring 没有上游进程，不存在这个问题。
@@ -3694,7 +4724,7 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 
 	tab_indent_ok() { printf '%s' "$1" | grep -q "^$(printf '\t')"; }
 # ---------------- 子集过滤（--self-test <模式>） ----------------
-	# 现有 385 条断言一行都没动，过滤是这么实现的：
+	# 既有的断言一条都没动（本轮新增 rc_case 前为 403 条，加后 410 条），过滤是这么实现的：
 	#   ① 区段级 —— 断言区以 `[N] 标题` 分段，整段不匹配就整段不执行，
 	#      连段内的准备代码（建临时目录 / 渲染配置 / 签证书）一起省掉；
 	#   ② 断言级 —— 段里不匹配的断言，交给辅助函数时直接不跑也不计数。
@@ -3737,7 +4767,7 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 					if (index(tolower($0), tolower(pat)) > 0) hit[nsec] = 1
 					next
 				}
-				if ($0 ~ /^[ \t]*(true|false|eq|skip)_case /) {
+				if ($0 ~ /^[ \t]*(true|false|eq|skip|rc)_case /) {
 					na++
 					aln[na] = NR
 					asec[na] = nsec
@@ -3773,10 +4803,10 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 		fi
 		printf '子集自检：模式「%s」，命中 %s / 共 %s 条断言\n' \
 			"${SELF_TEST_PATTERN}" "$st_kept" "$st_total"
-		# 断言级过滤：把四个辅助函数换成「先问该不该跑、再转交原实现」的包装器。
+		# 断言级过滤：把五个辅助函数换成「先问该不该跑、再转交原实现」的包装器。
 		# 原实现用 declare -f 拷出来（不是重写的），语义与原来逐字一致。
 		local st_fn="" st_def=""
-		for st_fn in true_case false_case eq_case skip_case; do
+		for st_fn in true_case false_case eq_case skip_case rc_case; do
 			st_def=$(declare -f "$st_fn")
 			eval "_st_orig_${st_fn}${st_def#"${st_fn}"}"
 		done
@@ -3791,6 +4821,9 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 		}
 		skip_case() {
 			if st_match "${BASH_LINENO[0]}"; then _st_orig_skip_case "$@"; fi
+		}
+		rc_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_rc_case "$@"; fi
 		}
 	fi
 
@@ -4003,14 +5036,28 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 
 	before=$(find "${CONF_DIR}" "${CADDY_BIN}" -maxdepth 1 2>/dev/null | sort | tr '\n' ' ' || true)
 	out=$(bash "$0" --check --domain a.example.com --email ops@mail.test 2>&1 || true)
-	true_case "--check 无需 root 即可完成" bash "$0" --check --domain a.example.com --email ops@mail.test
+	# 原本这里是 true_case（期望退 0）。A2 之后 --check 发现问题就退 1，
+	# 而 a.example.com 在真实环境里必然有问题（没有 ss / DNS 不符），
+	# 继续期望 0 会让这条在每台机器上假红。
+	# 语义不能退化成「必然失败」—— 这条要断的是「无需 root 即可完成」，
+	# 所以改断「完成」而不是「退 0」：不退 126/127（指令找不到 / 不可执行）、
+	# 不退化成 root 拦截，且真的打出了体检结论（撞到第一项就退出就打不出结论）。
+	# 用 rc_case 表达「不是某两个码」：期望 1 恰好把 126/127 排除掉 ——
+	# 真实环境里 a.example.com 必然有问题，所以 1 就是这里的确定值；
+	# 干净环境退 0 由 [21] 的 check_exits_0_when_clean 在沙箱里锁住。
+	rc_case "--check 无需 root 即可完成（不退 126/127）" 1 \
+		bash "$0" --check --domain a.example.com --email ops@mail.test
+	true_case "--check 不要求 root（没打出管理员权限提示）" \
+		not_has "$out" '这一步需要管理员权限'
 	true_case "--check 输出体检结论" has "$out" '结论'
 	false_case "--check 不凭空生成密码（曾会打印一个假密码）" has "$out" '已自动生成'
 	true_case "--check 密码位置显示占位符" has "$out" '部署时自动生成'
 	false_case "--check 不打印任何真实密码形态" has "$out" 'basic_auth tom [A-Za-z0-9]{8,}'
 	local aout=""
 	aout=$(NAIVE_ASCII=1 bash "$0" --check --domain a.example.com 2>&1 || true)
-	true_case "ASCII 模式可用（老终端兜底）" env NAIVE_ASCII=1 bash "$0" --check --domain a.example.com
+	# 同上面那条：A2 之后 --check 发现问题退 1，这里断「跑得完」而不是「退 0」。
+	rc_case "ASCII 模式可用（老终端兜底，不退 126/127）" 1 \
+		env NAIVE_ASCII=1 bash "$0" --check --domain a.example.com
 	false_case "ASCII 模式下不出现 UTF-8 标记" has "$aout" '✓'
 	# 断言必须绑在"与外部工具无关"的字形上：
 	# 之前绑的是 "+ 端口 …空闲"，而端口探测改成三态后，
@@ -4321,7 +5368,16 @@ SSLCNF
 			true_case "匹配的证书/私钥被接受" validate_tls_cert_pair "${cdir}/c.pem" "${cdir}/k.pem"
 			false_case "写反（证书当私钥）被拒绝" validate_tls_cert_pair "${cdir}/c.pem" "${cdir}/c.pem"
 			false_case "体检拒绝写反的证书对" bash "$0" --check --domain a.example.com --email o@m.test --tls-cert "${cdir}/c.pem" --tls-key "${cdir}/c.pem"
-			true_case "--tls-cert= 等号形式可用" bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem"
+			# 这条要断的是「等号形式能被解析」，不是「体检结论为通过」——
+			# A2 之后 --check 发现问题就退 1，拿 0 当期望会在每台机器上假红。
+			# 用 rc_case 期望 1：既证明等号形式没被当成非法参数（那会是 1，
+			# 但同时也打不出体检结论），又排除了 126/127。是否真的接受，
+			# 由下面那条「参数被接受、走得进体检」的断言补上。
+			rc_case "--tls-cert= 等号形式可用（不退 126/127）" 1 \
+				bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem"
+			true_case "--tls-cert= 等号形式被接受（未退化成参数错）" \
+				not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem" 2>&1 || true)" \
+				'参数不合法|必须同时给出'
 		else
 			skip_case "证书配对行为断言（本机 openssl 签不出证书）"
 		fi
@@ -4558,15 +5614,28 @@ SSLCNF
 	false_case "体检拒绝 --cert-mode file 却无文件" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode file
 	false_case "体检拒绝 --cert-mode acme 却无 token" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode acme
 	false_case "体检拒绝不存在的 token 文件" bash "$0" --check --domain a.example.com --email o@m.test --cf-token-file /nonexistent/cf
-	true_case "体检接受 auto 模式（无 token 时退 caddy）" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto
-	true_case "体检默认就是 auto" bash "$0" --check --domain a.example.com --email o@m.test
-	true_case "--acme-staging 被接受" bash "$0" --check --domain a.example.com --email o@m.test --acme-staging
+	# 这三条断的是「参数被接受」，不是「体检结论为通过」。
+	# A2 之后 --check 发现问题退 1，所以改断「走得进体检、没被参数校验拦下」：
+	# 真被拦下时打的是「参数不合法 / 必须同时给出」这类 die 文案，而不是体检结论。
+	# 期望码 1 同时排除了 126/127（指令找不到 / 不可执行）。
+	rc_case "体检接受 auto 模式（无 token 时退 caddy）" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto
+	true_case "体检接受 auto 模式（确实走进了体检，未退化成参数错）" \
+		not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto 2>&1 || true)" '参数不合法|cert-mode.*非法'
+	rc_case "体检默认就是 auto" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test
+	true_case "体检默认就是 auto（确实走进了体检）" \
+		has "$(bash "$0" --check --domain a.example.com --email o@m.test 2>&1 || true)" '结论'
+	rc_case "--acme-staging 被接受" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test --acme-staging
+	true_case "--acme-staging 被接受（确实走进了体检）" \
+		not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --acme-staging 2>&1 || true)" '未知参数|不合法'
 	# --cert-mode= 等号形式（与 --tls-cert= 同源的一致性要求）
 	false_case "cert-mode= 等号形式同样生效" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode=bogus
 
 	fi
 	# ---- 19) 子集自检自身的收尾（SC2295 / 区域索引 / 过滤行为）----
-	# 这一节单独成节，不混进上面任何既有区段：既有 385 条一行没动，这里纯新增。
+	# 这一节单独成节，不混进上面任何既有区段：既有断言一条没动，[19d] 的 rc_case 相关为纯新增。
 	if st_want 19; then
 	printf '\n[19] 子集自检收尾（SC2295 / 区域索引 / 过滤行为）\n'
 
@@ -4593,6 +5662,23 @@ SSLCNF
 	# 过滤「静默失效」（最危险的一种坏法）：报数行照旧漂亮，实际却跑满全量。
 	# 只数真跑出来的 PASS，不看报数行，才逮得住。
 	true_case "子集只跑命中的断言、不多跑" self_test_subset_isolates_sections
+
+	# ---- 19d) rc_case 自证（新增辅助自身可用 + 不会被过滤静默漏掉）----
+	# 最危险的坏法不是「rc_case 算错」，而是「它被漏在过滤之外」：
+	# 那不会报任何错，只是 --self-test <模式> 少跑几条 —— 静默漏测。
+	# 所以既要证明它能用（真调一次、精确比对非 0 退出码），也要证明
+	# 扫描器认得带 rc_case 的行（认不得时子集会「零命中即报错」，正好被逮住）。
+	rc_case "rc_case 自证：读到真实退出码 3（非 0 也精确比对）" 3 bash -c 'exit 3'
+	# 断言行自己不许含被搜的字面量（否则断的是这一行、不是那段代码）—— 与 [8] 同法：用变量拼。
+	local st_fpat="for st_fn in true_case false_case eq_case skip_case rc"
+	st_fpat="${st_fpat}_case"
+	true_case "rc_case 已加进过滤包装器列表（漏了就静默漏测）" \
+		has "$(fn_code self_test)" "$st_fpat"
+	local st_opat="_st_orig_rc"
+	st_opat="${st_opat}_case"
+	true_case "rc_case 的过滤包装器已定义并转交原实现" \
+		has "$(fn_code self_test)" "$st_opat"
+	true_case "扫描器认得 rc_case 断言行（子集不会漏测）" rc_case_subset_scan_counts
 
 	fi
 	# ---- 20) 退出码 2：部署完成但验证未确认（v2.6.0 新增）----
@@ -4637,6 +5723,130 @@ SSLCNF
 	true_case "usage 说明 --skip-verify 记 0" has "$(fn_body usage)" 'skip-verify.*退出码仍记 0'
 	true_case "usage 说明 2 表示部署已完成" has "$(fn_body usage)" '部署已经完成'
 	true_case "usage 说明 2 不是参数写错" has "$(fn_body usage)" '参数写错了'
+
+	fi
+	# ---- 21) --check 的诚实退出码 + unknown 端口（BATCH B1 新增）----
+	# 本节纯新增，上面 410 条一行没动。
+	# 全部走 _do_check_sandbox：本机没有 ss、ubuntu CI 有、alpine CI 没有 ——
+	# 断言只要有一次真的读到宿主环境，就会变成「ubuntu 绿、Alpine 红」。
+	# 沙箱把 port_state 桩成三态可控，判据完全由断言自己给定。
+	if st_want 21; then
+	printf '\n[21] --check 的诚实退出码 + unknown 端口（BATCH B1）\n'
+
+	# ---- 21a) A2：退出码必须跟着「有没有问题」走 ----
+	true_case "有问题时 --check 退 1（原 bug 是 0）" check_exits_1_when_problems
+	# 护栏：没有这条，把 do_check 改成无条件 return 1 也能让上面那条绿。
+	true_case "干净环境 --check 退 0（防一刀切退 1）" check_exits_0_when_clean
+	true_case "端口被占时 --check 退 1" check_problems_track_port_state
+	# 只读性：有问题也只是退出码变了，体检本身照样跑完（不退化成 126/127）。
+	true_case "--check 发现问题时仍走完体检（只读）" check_problems_still_completes_readonly
+
+	# ---- 21b) G：unknown 不许再被当成「没问题」 ----
+	# 行为级：本机与 alpine CI 的真实现状（没有 ss）。
+	true_case "ss 缺失时 --check 退 1（查不了≠可以装）" check_problems_unknown_when_ss_missing
+	# 结构级：行为断言桩掉了 need_cmd，只覆盖这一条路径；
+	# 结构断言直接盯源码里那一行，谁把 problems++ 删掉都立刻红。
+	true_case "do_check 端口 *) 分支计入 problems" check_ports_branch_has_problems
+	# 两处口径必须一致，否则 preflight 与 --check 对同一台机器裁决不同。
+	true_case "preflight 端口 *) 分支同格（受 --yes 管辖的 confirm）" check_preflight_ports_branch_guarded
+
+	# ---- 21c) 文案：usage 要说清「1 也可以表示体检发现问题」 ----
+	# 退出码帮助段不写这一句，下一个人看到 --check 退 1 会去查参数，
+	# 而参数根本没问题 —— 正是本项目一直在防的「误导性诚实」。
+	true_case "usage 说明 1 也表示体检发现问题" has "$(fn_body usage)" '体检发现'
+	true_case "usage 说明 --check 退 1 不等于跑失败" has "$(fn_body usage)" '不是「跑失败了」'
+
+	fi
+	# ---- 22) 静默失败：client-config / 开机自启 / 未做校验（BATCH B2 新增）----
+	# 本节纯新增，上面 424 条一行没动。
+	# 主题一致：这三件事原来都是「失败了照样报成功」。修法不同（一处退 2、
+	# 一处退 1、一处必须保持退 0），所以断言也各按各的契约来断。
+	if st_want 22; then
+	printf '\n[22] 静默失败：client-config / 开机自启 / 未做校验（BATCH B2）\n'
+
+	# ---- 22a) F3：client-config.json 写失败被吞（两处调用点，机制【不同】）----
+	# 结构级：两处都不得再有 `CLIENT_CONF … || true`。
+	# 用 fn_code 而非 fn_body —— 注释里会提到这些词，会把断言喂饱（等于没测）。
+	true_case "print_summary 不再吞 client-config 写失败" \
+		not_has "$(fn_code print_summary)" 'CLIENT_CONF.*\|\|[[:space:]]*true'
+	true_case "do_rotate_password 不再吞 client-config 写失败" \
+		not_has "$(fn_code do_rotate_password)" 'CLIENT_CONF.*\|\|[[:space:]]*true'
+	# 顺序级（红线 3）：换密码那条路必须先打印新密码再失败化。
+	# 反了就是「新密码已生效、服务已重载，用户却看不到密码」= 被锁在门外。
+	true_case "换密码：先打印新密码、后失败化" rotate_prints_password_before_dying
+	# 机制级：那一处必须是 `|| die` —— 用 verify_warn 会被 main 的 `return 0`
+	# 静默弃掉（计数器加了、退出码照样 0），只删 `|| true` 则被 set -e 裸终止。
+	true_case "换密码：写失败处挂的是 || die（不是 verify_warn）" rotate_write_is_failure_ized
+	# 行为级①：调用点① 走 verify_warn —— 计数 +1，且不再广告「已存到」。
+	true_case "摘要：写不成 config 时计入警告且不谎称已存到" summary_warns_when_client_conf_unwritable
+	# 行为级②：调用点② 走 die —— 非 0 退出，且新密码已经打印出来。
+	# 这两条合起来才排得掉「用 verify_warn 静默失效」与「die 排在打印之前」两种改错法。
+	true_case "换密码：config 写不成时退非 0 且新密码已打印" rotate_dies_after_printing_password
+
+	# ---- 22b) F1/F2：开机自启被吞（systemd / openrc 两支）----
+	# 结构级：enable 那两行不得再挂 `|| true`（一个正则同时管住两支）
+	true_case "install_service 不再吞开机自启失败" \
+		not_has "$(fn_code install_service)" '(enable caddy|rc-update add caddy).*\|\|[[:space:]]*true'
+	# 反向守卫（红线 2）：也不能改成 return 1 —— 那会经 run_stage 的 exit 1
+	# 跳过 print_summary，用户拿不到密码。真跑一遍失败注入，断它仍返回 0。
+	true_case "systemd 支：自启设不上时仍返回 0（不丢摘要）" \
+		install_service_selfstart_warns_not_fails systemd
+	true_case "openrc 支：自启设不上时仍返回 0（不丢摘要）" \
+		install_service_selfstart_warns_not_fails openrc
+	# 行为级：失败必须真的记进 VERIFY_WARNINGS，否则「不吞」只是文案上的
+	true_case "systemd 支：自启设不上时计入警告（→ 退 2）" \
+		install_service_selfstart_counts_warning systemd
+	true_case "openrc 支：自启设不上时计入警告（→ 退 2）" \
+		install_service_selfstart_counts_warning openrc
+
+	# ---- 22c) F4：未做完整性校验要回显，但退出码保持 0 ----
+	# 结构级：标志必须设在「没提供 digest」那一支上，不能设在「校验通过」那一支
+	# （后者会让摘要谎报「本次没校验」，方向正好反过来的假信息）。
+	true_case "install_caddy_binary 在无 digest 分支设状态" caddy_digest_flag_set_in_no_digest_branch
+	true_case "print_summary 回显「本次未做完整性校验」" \
+		has "$(fn_body print_summary)" 'CADDY_DIGEST_MISSING'
+	# 行为级：上游没给 digest 时 main 仍退 0（不许变成每次部署都退 2 的假失败）
+	true_case "上游没提供校验和时 main 仍退出 0" main_exits_0_when_digest_missing
+	# 行为级：真的走一遍无 digest 分支 —— 返回 0 且把状态记下来
+	true_case "无 digest 时 install_caddy_binary 返回 0 并记状态" install_caddy_binary_no_digest_ok
+
+	fi
+	# ---- 23) A + B：非 TTY Default-Deny 与 DNS 两分支（BATCH B3 新增）----
+	# 本节纯新增，上面 439 条一行没动。
+	# A 是本项目唯一一处「从零建覆盖」—— 断言块里此前 `-t 0` 命中 0 次，
+	# 也就是说「非交互时 confirm 干了什么」从来没被测过。
+	# 所以这里不写结构断言为主、行为断言为辅，而是反过来：
+	# 行为级断言必须【真跑一遍 main】。理由见 confirm_denies_and_main_stops 的注释。
+	if st_want 23; then
+	printf '\n[23] 非 TTY Default-Deny + DNS 两分支（BATCH B3）\n'
+
+	# ---- 23a) A：非交互下预检的警告必须停下 ----
+	# 🔴 核心：走 main 的 `preflight || exit 1`，不是只调 preflight。
+	# 只调 preflight 会拿到 rc=1 看着"修好了"，而 main 那条路上照样放行 ——
+	# 这正是本批次最容易做成的假修，实测复现过。
+	true_case "非交互 + 预检警告：main 被拦住且不打印「预检完成」" confirm_denies_and_main_stops
+	# 护栏：没有这条，「Default-Deny」会被写成「有警告就一律拒绝」，打死 CI 夹具。
+	true_case "非交互 + --yes：警告照打但放行（退 0）" confirm_allows_with_yes
+	# 第 4 个判定点：--purge 不走预检（do_uninstall 在 preflight 之前），
+	# 它只能靠 confirm 自己拒绝 —— 单独覆盖。
+	true_case "非交互 + --purge 无 --yes：不放过不可撤销的清理" purge_needs_confirm_when_noninteractive
+	# 端口循环：失败不许被后一轮的 ok 冲掉（只在「一占一空」时才暴露）
+	true_case "非交互 + 端口被占（另一个端口空闲）：main 仍被拦住" port_warning_stops_main
+
+	# 结构级：非交互分支不得再有 `return 0`（那正是原来的 Default-Allow）。
+	# 必须【只】看 `[ ! -t 0 ]` 那一支 —— 函数里合法存在另一个 `return 0`
+	# （case 的 y/Y 分支），整函数扫一遍会把它当成违规，断言就永远红。
+	true_case "confirm 的非交互分支不再放行（该分支内无 return 0）" confirm_noninteractive_branch_denies
+	# 反向守卫：交互式按回车的取消路径必须仍是 exit 0（[12] 那两条断言的同源复核）
+	true_case "confirm 仍保留交互式取消的 exit 0" has "$(fn_code confirm)" 'exit 0'
+
+	# ---- 23b) B：check_domain_dns 的 else 已一分为二 ----
+	# 结构级：confirm 从 1 处变 2 处（「解析到别的 IP」与「查不到 A 记录」两分支对齐）
+	true_case "check_domain_dns 有两处 confirm（原为 1）" domain_dns_has_two_confirms
+	# 行为级（B 最该锁的一条）：不能把「本机公网 IP 拿不到」也塞进带 confirm 的分支 ——
+	# 那种情况下判定本身就不可靠，问人是噪音。两个读数成对跑。
+	true_case "域名查不到 A 记录 → 问人（confirm 出现）" b_dns_missing_asks
+	true_case "本机公网 IP 拿不到 → 只警告不问人（confirm 不出现）" b_public_ip_missing_does_not_ask
 
 	fi
 # ST_ASSERT_END
