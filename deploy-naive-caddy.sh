@@ -529,10 +529,14 @@ NaiveProxy 服务端部署脚本 v2.6.1
      另外，--check 体检发现需要先处理的问题时也退 1：这样
      `if ./deploy-naive-caddy.sh --check; then` 才真的代表体检通过。
      体检本身仍然是只读的，退 1 只是「有情况」，不是「跑失败了」。
-  2  部署已经完成 —— 密码与 client-config.json 都照常打印，
-     只是阶段 7 的验证里有几项没能当场确认（本机 HTTPS 握手 / 证书信息 /
-     代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，
-     过几十秒重跑同一条命令复查即可；全过之后退出码就是 0。
+  2  部署已经完成 —— 密码与 client-config.json 都照常打印，只是有情况要你知道。
+     分两类：
+       · 没能当场确认 —— 阶段 7 的验证有几项没测出来（本机 HTTPS 握手 / 证书信息 /
+         代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，过几十秒
+         重跑同一条命令复查即可。
+       · 已经确认有问题 —— 开机自启没设上、client-config.json 没写成这类。
+         它们不会自己好，要按摘要里那条提示动手修一次，再重跑同一条命令复查。
+     两类都算「部署完成」；复查全过之后退出码就是 0。
      脚本退出码 2【不是】「参数写错了」—— 那种情况是 1，参数解析在部署之前。
 
 运维：
@@ -1883,6 +1887,9 @@ install_caddy_binary() {
 			fi
 			ok "下载校验通过（sha256 与官方发布一致）"
 		else
+			# 「上游没给 digest」≠「校验通过」。当时那一行 warn 会滚走，
+			# 而用户是照着摘要做验收的 —— 记一个跨阶段标志，让摘要把这件事说出来。
+			CADDY_DIGEST_MISSING="yes"
 			warn "该发布没有提供校验和，无法验证下载完整性"
 		fi
 
@@ -2165,7 +2172,12 @@ install_service() {
 		backup_if_exists "${SVC_FILE}"
 		render_systemd_unit > "${SVC_FILE}" || { err "写入 ${SVC_FILE} 失败"; return 1; }
 		systemctl daemon-reload || true
-		systemctl enable caddy >/dev/null 2>&1 || true
+		# 自启设不上必须说出来：用户以为「装好了」，重启后服务却不会起来。
+		# 但【不能】return 1 —— 那会经 run_stage 的 exit 1 跳过 print_summary，
+		# 用户拿不到密码（假失败）。verify_warn 只记数，由 main 末尾统一退 2。
+		if ! systemctl enable caddy >/dev/null 2>&1; then
+			verify_warn "开机自启没设上（systemctl enable caddy 失败）—— 重启后 caddy 不会自动启动，请手动执行: systemctl enable caddy"
+		fi
 		if systemctl is-active --quiet caddy; then
 			systemctl restart caddy || { err "重启 caddy 失败"; return 1; }
 		else
@@ -2177,7 +2189,10 @@ install_service() {
 		backup_if_exists "${OPENRC_FILE}"
 		render_openrc_script > "${OPENRC_FILE}" || { err "写入 ${OPENRC_FILE} 失败"; return 1; }
 		chmod +x "${OPENRC_FILE}"
-		rc-update add caddy default >/dev/null 2>&1 || true
+		# 同 systemd 支：只记数、不 return 1（否则摘要被跳过，用户丢密码）
+		if ! rc-update add caddy default >/dev/null 2>&1; then
+			verify_warn "开机自启没设上（rc-update add caddy default 失败）—— 重启后 caddy 不会自动启动，请手动执行: rc-update add caddy default"
+		fi
 		rc-service caddy restart || rc-service caddy start || { err "启动 caddy 失败"; return 1; }
 		ok "openrc 服务已启动"
 	else
@@ -2196,6 +2211,11 @@ VERIFY_WARNINGS=0
 # 跳过验证 != 验证通过。摘要必须能区分这两件事。
 VERIFY_SKIPPED="no"
 VERIFY_NOTES=()
+# 阶段 2 设、摘要读的跨阶段状态：上游这个发布没提供 sha256，本次没做下载校验。
+# 与 VERIFY_SKIPPED 同族 —— 都是「状态回显」，刻意【不】算 verify_warn：
+# 是否提供 digest 由上游决定，用户在本机修不了，记成警告会让每次部署都退 2
+# （那是假失败）。上游侧另有守门：upstream-drift.yml 每天查 digest 并 ::error::。
+CADDY_DIGEST_MISSING="no"
 
 verify_warn() { # <一句话说明这一项没通过>
 	VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1))
@@ -2398,9 +2418,22 @@ print_summary() {
 	local host="${DOMAIN}"
 	if [ "$HTTPS_PORT" != "443" ]; then host="${DOMAIN}:${HTTPS_PORT}"; fi
 
+	# 写没写成，决定下面那行广告怎么写 —— 不能写失败了还照说「已存到 X，权限 0600」。
+	# 这里【不能】die：摘要正在打印、用户还要拿密码。用 verify_warn：它参与 main
+	# 末尾的退出码判定（→ 退 2），正是「部署完成但有一项没做成」的语义。
+	local conf_state="missing"
 	if [ "$CREDS_KNOWN" = "yes" ]; then
-		render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" || true
-		chmod 0600 "${CLIENT_CONF}" 2>/dev/null || true
+		if render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}"; then
+			# 权限也是这份配置的一部分：里面是明文密码，收不紧同样得说出来
+			if chmod 0600 "${CLIENT_CONF}" 2>/dev/null; then
+				conf_state="ok"
+			else
+				conf_state="insecure"
+				verify_warn "${CLIENT_CONF} 权限没能设成 0600（里面是明文密码）—— 请手动执行: chmod 0600 ${CLIENT_CONF}"
+			fi
+		else
+			verify_warn "客户端 config.json 没能写到 ${CLIENT_CONF} —— 下面那一段请自己复制保存成文件"
+		fi
 	fi
 
 	# 「部署完成」和「验证通过」必须是两个词 —— 别让用户以为一切正常
@@ -2418,7 +2451,8 @@ print_summary() {
 		for n in "${VERIFY_NOTES[@]}"; do
 			printf '%s\n' "  ${C_YEL}${G_WARN}${C_RST} ${n}"
 		done
-		printf '%s\n' "  ${C_DIM}这几项多半几十秒内会自己好（证书还在签发）。过一会儿重跑同一条命令即可复查。${C_RST}"
+		printf '%s\n' "  ${C_DIM}证书签发那类几十秒内会自己好；其余（如开机自启、config 没写成）不会自己好，${C_RST}"
+		printf '%s\n' "  ${C_DIM}要按上面那条提示动手修一次，再重跑同一条命令复查。${C_RST}"
 		printf '%s\n' "  ${C_DIM}退出码 2 = 部署已完成（不是失败）；复查全过之后就会变成 0。${C_RST}"
 	fi
 
@@ -2427,6 +2461,13 @@ print_summary() {
 	info "  端口      ${HTTPS_PORT}"
 	info "  配置文件  ${CONF_FILE}"
 	info "  日志      ${LOG_DIR}/access.log"
+	# 阶段 2 没做完整性校验这件事，不能只在当时一行灰字里滚过去 —— 用户照着摘要验收。
+	# 退出码刻意保持 0：上游给不给 digest 不是本机的部署质量，用户也修不了。
+	if [ "${CADDY_DIGEST_MISSING}" = "yes" ]; then
+		warn "  完整性    本次未做下载校验 —— 上游这个发布没有提供 sha256，无从比对"
+		warn "            这不是本机的问题，也不影响已装好的 caddy 能不能跑"
+		warn "            上游补上校验和后，重跑 --upgrade 会自动开始校验"
+	fi
 
 	# 证书这一环单独说清楚：用户最关心的两个问题是「谁签的」和「会不会自动续」。
 	print_cert_summary
@@ -2437,7 +2478,17 @@ print_summary() {
 		printf '%s\n' "    密码      ${C_BLD}${NAIVE_PASS}${C_RST}   ${C_DIM}← 现在复制这一串${C_RST}"
 		printf '\n%s\n\n' "    ${C_DIM}忘了密码？  sudo cat ${STATE_FILE}${C_RST}"
 
-		printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_DIM}（已存到 ${CLIENT_CONF}，权限 0600）${C_RST}"
+		case "${conf_state}" in
+			ok)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_DIM}（已存到 ${CLIENT_CONF}，权限 0600）${C_RST}"
+				;;
+			insecure)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_YEL}（已存到 ${CLIENT_CONF}，但权限不是 0600 —— 里面是明文密码，请手动收紧）${C_RST}"
+				;;
+			*)
+				printf '%s\n' "  ${C_BLD}客户端 config.json${C_RST}${C_YEL}（没能写入 ${CLIENT_CONF} —— 请把下面这段自己存成 config.json）${C_RST}"
+				;;
+		esac
 		render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" | sed 's/^/    /'
 		printf '\n%s\n\n' "    ${C_DIM}连接串    https://${NAIVE_USER}:${NAIVE_PASS}@${host}${C_RST}"
 		printf '\n%s\n' "  ${C_BLD}客户端连不上时${C_RST}"
@@ -2603,8 +2654,6 @@ do_rotate_password() {
 	chown root:caddy "${CONF_FILE}" || die "设置 ${CONF_FILE} 属主失败"
 
 	state_write || die "更新状态文件失败"
-	render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" || true
-	chmod 0600 "${CLIENT_CONF}" 2>/dev/null || true
 
 	if [ "$INIT" = "systemd" ]; then
 		systemctl reload caddy || systemctl restart caddy || die "重载服务失败"
@@ -2613,6 +2662,17 @@ do_rotate_password() {
 	fi
 	ok "密码已更换，服务已平滑重载"
 	info "  新密码    ${NAIVE_PASS}"
+	# 写 client-config 必须排在「打印新密码」【之后】，而且这里只能用 die：
+	#   · main 里是 `do_rotate_password; return 0` —— 那个 return 0 无条件弃掉退出码，
+	#     用 verify_warn 只会加计数器、退出码照样 0，等于换个地方假绿；
+	#   · 而 die 会终止脚本。若把它排在打印之前，新密码已经生效、服务已经重载，
+	#     用户却看不到密码 —— 直接被锁在门外。
+	# `|| die` 不能省成裸重定向：set -Eeuo pipefail 下重定向失败会当场终止脚本，
+	# 绕过下面这段文案（参照同函数 state_write 的写法）。
+	render_client_config "$NAIVE_USER" "$NAIVE_PASS" "$DOMAIN" "$HTTPS_PORT" "$CLIENT_PROTO" > "${CLIENT_CONF}" \
+		|| die "新密码已生效（见上面那一行），但没能写入 ${CLIENT_CONF} —— 请把上面的密码手动填进客户端 config.json"
+	chmod 0600 "${CLIENT_CONF}" 2>/dev/null \
+		|| die "${CLIENT_CONF} 已写入，但权限没能设成 0600（里面是明文密码）—— 请手动执行: chmod 0600 ${CLIENT_CONF}"
 	info "  客户端配置已更新: ${CLIENT_CONF}"
 	warn "记得在客户端也改成新密码 —— 旧密码已经失效"
 }
@@ -3957,6 +4017,314 @@ self_test_report() {
 	return 0
 }
 
+# ============================================================================
+# BATCH B2 的行为级辅助（F3 / F1 / F2 / F4）
+#
+# 共同点：都真起子进程跑被测函数，看它实际返回什么 / 打印什么 / 退出码是多少。
+# 不靠字符串匹配断言「行为」—— 本项目反复踩过「断言绿、行为红」。
+# 系统依赖一律离桩（本机是 Windows Git Bash，没有 root / systemd / caddy，
+# 而且红线禁止碰真系统）。
+# ============================================================================
+
+# 结构级（F3 调用点②）：do_rotate_password 里「打印新密码」必须早于「写 client-config」。
+# 顺序反了就是红线 3：die 在打印之前触发 → 新密码已生效、服务已重载，
+# 用户却看不到密码，只能去翻 state 文件 = 被锁在门外。
+# 只比行号不看内容 —— 内容由下面那条行为断言管。
+rotate_prints_password_before_dying() {
+	_self_test_nested_skip && return 0
+	local code="" a="" b=""
+	code=$(fn_code do_rotate_password) || return 1
+	a=$(printf '%s\n' "$code" | grep -n 'info "  新密码' | head -1 | cut -d: -f1)
+	b=$(printf '%s\n' "$code" | grep -n 'render_client_config' | head -1 | cut -d: -f1)
+	if [ -z "$a" ] || [ -z "$b" ]; then
+		printf '  在 do_rotate_password 里找不到「打印新密码」(行 %s) 或「写 client-config」(行 %s)\n' \
+			"${a:-无}" "${b:-无}" >&2
+		return 1
+	fi
+	if [ "$a" -ge "$b" ]; then
+		printf '  「打印新密码」在第 %s 行、「写 client-config」在第 %s 行 —— 顺序反了。\n' "$a" "$b" >&2
+		printf '  写失败时 die 会先终止脚本，用户拿不到新密码（而密码此时已经生效）= 被锁在门外。\n' >&2
+		return 1
+	fi
+	return 0
+}
+
+# 结构级（F3 调用点②）：写失败那一处必须挂 `|| die`。
+# 单独一条（不并进上面那条顺序断言）是为了让失败原因唯一可读。
+# 为什么必须是 die 而不是 verify_warn：main 里是
+# `if [ "$ROTATE_PASSWORD" = yes ]; then do_rotate_password; return 0; fi` ——
+# 那个 return 0 无条件弃掉退出码，verify_warn 只会加计数器、退出码照样 0，
+# 等于换个地方假绿。而只删掉 `|| true` 不挂 `|| die` 也不行：
+# set -Eeuo pipefail 下裸重定向失败会当场终止脚本、绕过自己的文案。
+rotate_write_is_failure_ized() {
+	_self_test_nested_skip && return 0
+	local code="" b="" seg=""
+	code=$(fn_code do_rotate_password) || return 1
+	b=$(printf '%s\n' "$code" | grep -n 'render_client_config' | head -1 | cut -d: -f1)
+	if [ -z "$b" ]; then
+		printf '  在 do_rotate_password 里找不到写 client-config 的那一行\n' >&2
+		return 1
+	fi
+	# 可能写成续行（`> file \` 换行 `|| die`），所以这一行连同下一行一起看
+	seg=$(printf '%s\n' "$code" | sed -n "$((b)),$((b + 1))p")
+	if printf '%s' "$seg" | grep -q '||[[:space:]]*die'; then
+		return 0
+	fi
+	printf '  写 client-config 那一处没挂「|| die」（第 %s 行起）—— 用 verify_warn 会静默失效\n' "$b" >&2
+	printf '  （main 的「return 0」弃掉退出码），裸写则会被 set -e 当场终止、绕过文案：\n%s\n' "$seg" >&2
+	return 1
+}
+
+# 行为级（F3 调用点①）：CREDS_KNOWN=yes 且 CLIENT_CONF 指向不可写路径时，
+# print_summary 必须 ① 计入 VERIFY_WARNINGS（→ main 末尾退 2）
+# ② 不再广告「已存到 X，权限 0600」。
+# 两件事分开断：只断计数会漏掉「计数对了、广告照旧」的假绿 —— 那正是原 bug 的样子。
+summary_warns_when_client_conf_unwritable() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" warns=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		DOMAIN="a.example.com"; HTTPS_PORT="443"
+		NAIVE_USER="naive"; NAIVE_PASS="Aa12345678"
+		CREDS_KNOWN="yes"; CLIENT_PROTO="https"
+		CERT_MODE_KNOWN="no"; PROBE_SECRET=""; PAC_PATH=""
+		# 父目录不存在 —— 重定向必然失败，正是要测的那条路
+		CLIENT_CONF="$2/nowrite/client-config.json"
+		VERIFY_WARNINGS=0; VERIFY_NOTES=()
+		print_summary
+		printf "__WARNS__%s\n" "$VERIFY_WARNINGS"
+	' _ "$lib" "$tdir" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	warns=$(printf '%s' "$out" | sed -n 's/.*__WARNS__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${warns:-0}" -lt 1 ] 2>/dev/null; then
+		printf '  写不成 client-config 时没有计入 VERIFY_WARNINGS（实得 %s）—— 静默失败，退出码会是 0\n' \
+			"${warns:-（读不到）}" >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if grep -q '已存到' <<< "$out"; then
+		printf '  文件没写成，摘要却照广告「已存到 X，权限 0600」—— 假信息\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级（F3 调用点②）：换密码时 CLIENT_CONF 不可写 → 必须【非 0 退出】，
+# 且【新密码已经打印出来】。
+# 为什么必须两件事一起断：只断退出码，用 verify_warn 的写法也能绿（计数器加了、
+# 退出码仍是 0 —— 换个地方假绿）；只断「打印了密码」，把 die 挪到打印之前也能绿
+# （用户被锁在门外）。这两条合起来才是 F3 调用点② 的完整契约。
+rotate_dies_after_printing_password() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" rc="" stdout_only="" pass="B2NewPass98765432"
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	# 2>/dev/null：把子 shell 自己的杂音（重定向失败的报错等）丢掉，
+	# 只看 __RC__ 与 stdout 段 —— 断的是「stdout 里有没有新密码」。
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		DOMAIN="a.example.com"; EMAIL="o@m.test"
+		HTTPS_PORT="443"; ALLOW_PORTS=""; PROBE_SECRET=""; PAC_PATH=""
+		CLIENT_PROTO="https"; TLS_CERT_FILE=""; TLS_KEY_FILE=""
+		CERT_MODE_ACTUAL="caddy"; INIT="systemd"
+		CONF_FILE="$2/caddy.conf"; : > "${CONF_FILE}"
+		STATE_FILE="$2/state"; : > "${STATE_FILE}"
+		CADDY_BIN="$2/caddy-stub"
+		printf "#!/bin/sh\nexit 0\n" > "${CADDY_BIN}"; chmod +x "${CADDY_BIN}"
+		# 父目录不存在 —— 写 client-config 必然失败
+		CLIENT_CONF="$2/nowrite/client-config.json"
+		B2_NEWPASS="$3"
+		# 系统依赖全部离桩：本机没有 root / caddy / systemctl（红线：不碰真系统）
+		state_load()     { return 0; }
+		state_write()    { return 0; }
+		render_caddyfile() { printf "stub\n"; }
+		gen_password()   { printf "%s\n" "$B2_NEWPASS"; }
+		chown()          { return 0; }
+		systemctl()      { return 0; }
+		rc-service()     { return 0; }
+		# do_rotate_password 里的 die 是 exit 1 —— 放进子 shell 才拦得住，
+		# 否则 `|| rc=$?` 与后面的 printf 都跑不到。
+		rc=0
+		( do_rotate_password >"$2/out.txt" 2>"$2/err.txt" ) || rc=$?
+		printf "__RC__%s\n" "$rc"
+		printf "__OUT_BEGIN__\n"
+		cat "$2/out.txt"
+		printf "__OUT_END__\n"
+	' _ "$lib" "$tdir" "$pass" 2>/dev/null)
+	rm -f "$lib"; rm -rf "$tdir"
+	rc=$(printf '%s' "$out" | sed -n 's/^__RC__//p' | tail -1)
+	stdout_only=$(printf '%s\n' "$out" | sed -n '/^__OUT_BEGIN__$/,/^__OUT_END__$/p')
+	if [ "${rc:-0}" = "0" ] || [ -z "$rc" ]; then
+		printf '  换密码时写不成 client-config，脚本却退出 0（实得 %s）—— 静默失败。\n' "${rc:-（读不到）}" >&2
+		printf '  main 里是「do_rotate_password; return 0」，所以这里只能用 die 而不能用 verify_warn。\n' >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if ! grep -qF -- "$pass" <<< "$stdout_only"; then
+		printf '  非 0 退出了，但新密码没打印到 stdout —— 密码已经生效、服务已重载，\n' >&2
+		printf '  用户却被锁在门外（红线 3）。stdout 段：\n%s\n' "$stdout_only" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级（F1/F2）：开机自启设不上时，install_service 必须
+# ① 仍然返回 0（不能 return 1 —— 那会经 run_stage 的 exit 1 跳过 print_summary，
+#    用户拿不到密码 = 假失败）② 把这件事计入 VERIFY_WARNINGS（否则「不吞」只是文案）。
+# 一次跑出两个读数，避免把同一个沙箱写两遍（写两遍就有漂移风险）。
+install_service_selfstart_failure() { # <systemd|openrc> —— 只打印 "__RC__<码> WARNS__<数>"
+	local init="$1" lib="" tdir="" out=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		INIT="$3"
+		CERT_MODE_ACTUAL="caddy"        # 不走 acme 续期分支
+		SVC_FILE="$2/caddy.service"; OPENRC_FILE="$2/caddy.openrc"
+		VERIFY_WARNINGS=0; VERIFY_NOTES=()
+		# 依赖全部离桩：本机没有 systemd / openrc，也不该去动真系统
+		ensure_cert_readable()   { return 0; }
+		ensure_log_dir_owner()   { return 0; }
+		backup_if_exists()       { return 0; }
+		render_systemd_unit()    { printf "stub\n"; }
+		render_openrc_script()   { printf "stub\n"; }
+		install_renewal()        { return 0; }
+		mkdir()                  { return 0; }
+		chmod()                  { return 0; }
+		systemctl() {
+			# enable 失败 —— 这就是注入的故障；其余子命令一律成功
+			case "$1" in enable) return 1 ;; esac
+			return 0
+		}
+		rc-service()  { return 0; }
+		rc-update()   { return 1; }     # openrc 支的 enable 等价物：同样失败
+		rc=0
+		install_service >/dev/null 2>&1 || rc=$?
+		printf "__RC__%s WARNS__%s\n" "$rc" "$VERIFY_WARNINGS"
+	' _ "$lib" "$tdir" "$init" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	printf '%s\n' "$out"
+}
+
+install_service_selfstart_warns_not_fails() { # <systemd|openrc>
+	local out="" rc="" warns=""
+	out=$(install_service_selfstart_failure "$1") || return 1
+	rc=$(printf '%s' "$out" | sed -n 's/.*__RC__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${rc:-x}" = "0" ]; then
+		return 0
+	fi
+	printf '  %s 支：自启设不上时 install_service 返回 %s（期望 0）。\n' "$1" "${rc:-（读不到）}" >&2
+	printf '  返回非 0 会经 run_stage 的 exit 1 跳过 print_summary —— 用户拿不到密码（假失败）。\n' >&2
+	printf '  原始输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+install_service_selfstart_counts_warning() { # <systemd|openrc>
+	local out="" warns=""
+	out=$(install_service_selfstart_failure "$1") || return 1
+	warns=$(printf '%s' "$out" | sed -n 's/.*WARNS__\([0-9]*\).*/\1/p' | tail -1)
+	if [ "${warns:-0}" -ge 1 ] 2>/dev/null; then
+		return 0
+	fi
+	printf '  %s 支：自启设不上却只记了 %s 条警告 —— 失败又被吞了（退出码会停在 0）。\n' \
+		"$1" "${warns:-（读不到）}" >&2
+	printf '  原始输出：\n%s\n' "$out" >&2
+	return 1
+}
+
+# 结构级（F4）：无 digest 分支必须设跨阶段标志，且设的是「没校验」那一支。
+# 只断「函数里出现过标志名」不够 —— 设在「校验通过」那一支上会让摘要
+# 谎报「本次没校验」，方向正好反过来的假信息。
+caddy_digest_flag_set_in_no_digest_branch() {
+	_self_test_nested_skip && return 0
+	local code="" prev=""
+	code=$(fn_code install_caddy_binary) || return 1
+	prev=$(printf '%s\n' "$code" | awk '
+		/^[[:space:]]*CADDY_DIGEST_MISSING="yes"[[:space:]]*$/ { print prev; exit }
+		{ prev = $0 }
+	')
+	if [ -z "$prev" ]; then
+		printf '  install_caddy_binary 里没有设 CADDY_DIGEST_MISSING="yes" 的那一行\n' >&2
+		return 1
+	fi
+	prev=$(printf '%s' "$prev" | tr -d '[:space:]')
+	if [ "$prev" = "else" ]; then
+		return 0
+	fi
+	printf '  设 CADDY_DIGEST_MISSING="yes" 的那一行前面是「%s」而不是 else ——\n' "$prev" >&2
+	printf '  标志可能被设在了「校验通过」那一支上，那会让摘要谎报「本次没做校验」。\n' >&2
+	return 1
+}
+
+# 行为级（F4）：上游没提供校验和时，main 的退出码必须【仍是 0】。
+# 理由：给不给 digest 是上游行为，用户在本机修不了；记成 verify_warn 会让
+# 每次部署都退 2 = 假失败。上游侧由 upstream-drift.yml 每日守门。
+main_exits_0_when_digest_missing() {
+	_self_test_nested_skip && return 0
+	local got=""
+	got=$(_verify_exit_rc '
+		install_caddy_binary() { CADDY_DIGEST_MISSING="yes"; return 0; }
+		main --domain a.example.com --email o@m.test
+	')
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	printf '  期望「上游没给校验和」时 main 仍退出 0。实得: %s\n' "${got:-（读不到退出码）}" >&2
+	printf '  非 0 = 有人把它接进 verify_warn 了 —— 那会让每次部署都退 2（假失败）。\n' >&2
+	return 1
+}
+
+# 行为级（F4）：真的跑一遍 install_caddy_binary 的无 digest 分支 ——
+# 返回 0 且把状态记下来。只断源码里写了标志名挡不住「分支根本没走到」。
+install_caddy_binary_no_digest_ok() {
+	_self_test_nested_skip && return 0
+	local lib="" tdir="" out="" rc="" flag=""
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	tdir=$(mktemp -d) || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		BUILD_FROM_SRC="no"; ARCH="x86_64"
+		CADDY_BIN="$2/caddy"
+		DEPLOY_LOG="$2/deploy.log"
+		# 上游没提供校验和 —— 这正是要测的那条路
+		resolve_caddy_tag()    { printf "v0.0.0-b2\n"; }
+		resolve_caddy_digest() { return 1; }
+		setup_deploy_log()     { return 0; }
+		show_log_tail()        { return 0; }
+		# curl / tar / find / install / mv 全部离桩：本机不联网、不碰真系统
+		curl() { local f=""; while [ $# -gt 0 ]; do case "$1" in -o) f="$2"; shift 2 ;; *) shift ;; esac; done; [ -n "$f" ] && : > "$f"; return 0; }
+		tar()  { local d=""; while [ $# -gt 0 ]; do case "$1" in -C) d="$2"; shift 2 ;; *) shift ;; esac; done; [ -n "$d" ] && : > "$d/caddy"; return 0; }
+		find()    { printf "%s/caddy\n" "$1"; }
+		install() { return 0; }
+		mv()      { return 0; }
+		need_cmd() { return 1; }        # 跳过 setcap 那一支
+		rc=0
+		install_caddy_binary >/dev/null 2>&1 || rc=$?
+		printf "__RC__%s FLAG__%s\n" "$rc" "${CADDY_DIGEST_MISSING}"
+	' _ "$lib" "$tdir" 2>&1)
+	rm -f "$lib"; rm -rf "$tdir"
+	rc=$(printf '%s' "$out" | sed -n 's/.*__RC__\([0-9]*\).*/\1/p' | tail -1)
+	flag=$(printf '%s' "$out" | sed -n 's/.*FLAG__\([a-z]*\).*/\1/p' | tail -1)
+	if [ "${rc:-x}" != "0" ]; then
+		printf '  无 digest 时 install_caddy_binary 返回 %s（期望 0）—— 上游行为不该让本机部署失败\n' \
+			"${rc:-（读不到）}" >&2
+		printf '  原始输出：\n%s\n' "$out" >&2
+		return 1
+	fi
+	if [ "$flag" != "yes" ]; then
+		printf '  无 digest 分支走过了，但 CADDY_DIGEST_MISSING=%s（期望 yes）—— 摘要回显不出来\n' \
+			"${flag:-（读不到）}" >&2
+		return 1
+	fi
+	return 0
+}
 
 self_test() {
 	local pass=0 fail=0 skip=0 rc=0
@@ -5049,6 +5417,60 @@ SSLCNF
 	# 而参数根本没问题 —— 正是本项目一直在防的「误导性诚实」。
 	true_case "usage 说明 1 也表示体检发现问题" has "$(fn_body usage)" '体检发现'
 	true_case "usage 说明 --check 退 1 不等于跑失败" has "$(fn_body usage)" '不是「跑失败了」'
+
+	fi
+	# ---- 22) 静默失败：client-config / 开机自启 / 未做校验（BATCH B2 新增）----
+	# 本节纯新增，上面 424 条一行没动。
+	# 主题一致：这三件事原来都是「失败了照样报成功」。修法不同（一处退 2、
+	# 一处退 1、一处必须保持退 0），所以断言也各按各的契约来断。
+	if st_want 22; then
+	printf '\n[22] 静默失败：client-config / 开机自启 / 未做校验（BATCH B2）\n'
+
+	# ---- 22a) F3：client-config.json 写失败被吞（两处调用点，机制【不同】）----
+	# 结构级：两处都不得再有 `CLIENT_CONF … || true`。
+	# 用 fn_code 而非 fn_body —— 注释里会提到这些词，会把断言喂饱（等于没测）。
+	true_case "print_summary 不再吞 client-config 写失败" \
+		not_has "$(fn_code print_summary)" 'CLIENT_CONF.*\|\|[[:space:]]*true'
+	true_case "do_rotate_password 不再吞 client-config 写失败" \
+		not_has "$(fn_code do_rotate_password)" 'CLIENT_CONF.*\|\|[[:space:]]*true'
+	# 顺序级（红线 3）：换密码那条路必须先打印新密码再失败化。
+	# 反了就是「新密码已生效、服务已重载，用户却看不到密码」= 被锁在门外。
+	true_case "换密码：先打印新密码、后失败化" rotate_prints_password_before_dying
+	# 机制级：那一处必须是 `|| die` —— 用 verify_warn 会被 main 的 `return 0`
+	# 静默弃掉（计数器加了、退出码照样 0），只删 `|| true` 则被 set -e 裸终止。
+	true_case "换密码：写失败处挂的是 || die（不是 verify_warn）" rotate_write_is_failure_ized
+	# 行为级①：调用点① 走 verify_warn —— 计数 +1，且不再广告「已存到」。
+	true_case "摘要：写不成 config 时计入警告且不谎称已存到" summary_warns_when_client_conf_unwritable
+	# 行为级②：调用点② 走 die —— 非 0 退出，且新密码已经打印出来。
+	# 这两条合起来才排得掉「用 verify_warn 静默失效」与「die 排在打印之前」两种改错法。
+	true_case "换密码：config 写不成时退非 0 且新密码已打印" rotate_dies_after_printing_password
+
+	# ---- 22b) F1/F2：开机自启被吞（systemd / openrc 两支）----
+	# 结构级：enable 那两行不得再挂 `|| true`（一个正则同时管住两支）
+	true_case "install_service 不再吞开机自启失败" \
+		not_has "$(fn_code install_service)" '(enable caddy|rc-update add caddy).*\|\|[[:space:]]*true'
+	# 反向守卫（红线 2）：也不能改成 return 1 —— 那会经 run_stage 的 exit 1
+	# 跳过 print_summary，用户拿不到密码。真跑一遍失败注入，断它仍返回 0。
+	true_case "systemd 支：自启设不上时仍返回 0（不丢摘要）" \
+		install_service_selfstart_warns_not_fails systemd
+	true_case "openrc 支：自启设不上时仍返回 0（不丢摘要）" \
+		install_service_selfstart_warns_not_fails openrc
+	# 行为级：失败必须真的记进 VERIFY_WARNINGS，否则「不吞」只是文案上的
+	true_case "systemd 支：自启设不上时计入警告（→ 退 2）" \
+		install_service_selfstart_counts_warning systemd
+	true_case "openrc 支：自启设不上时计入警告（→ 退 2）" \
+		install_service_selfstart_counts_warning openrc
+
+	# ---- 22c) F4：未做完整性校验要回显，但退出码保持 0 ----
+	# 结构级：标志必须设在「没提供 digest」那一支上，不能设在「校验通过」那一支
+	# （后者会让摘要谎报「本次没校验」，方向正好反过来的假信息）。
+	true_case "install_caddy_binary 在无 digest 分支设状态" caddy_digest_flag_set_in_no_digest_branch
+	true_case "print_summary 回显「本次未做完整性校验」" \
+		has "$(fn_body print_summary)" 'CADDY_DIGEST_MISSING'
+	# 行为级：上游没给 digest 时 main 仍退 0（不许变成每次部署都退 2 的假失败）
+	true_case "上游没提供校验和时 main 仍退出 0" main_exits_0_when_digest_missing
+	# 行为级：真的走一遍无 digest 分支 —— 返回 0 且把状态记下来
+	true_case "无 digest 时 install_caddy_binary 返回 0 并记状态" install_caddy_binary_no_digest_ok
 
 	fi
 # ST_ASSERT_END

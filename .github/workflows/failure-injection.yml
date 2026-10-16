@@ -172,6 +172,17 @@ jobs:
               echo "  阶段 $s：注入已生效但退出码 0 —— 失败未反映到退出码（bug）"
               rc=1
             fi
+            # ③ 阶段 6 专项（F1/F2）：撤销注入后的那次是干净部署 —— 开机自启必须
+            # 真的设上。端口冲突只该影响 start，不该影响 enable；而 enable 被吞、
+            # 被改成 return 1、或取反写丢，都会让这台机器重启后 caddy 不自启，
+            # 且部署当下完全看不出来（摘要照说「已启动」）。
+            if [ "$s" = "6" ]; then
+              en=$(sed -n 's/^SVC_ENABLED_C=//p' "$f")
+              if [ "$en" != "enabled" ]; then
+                echo "  阶段 6：撤销注入后 systemctl is-enabled caddy = ${en:-（读不到）}（期望 enabled）—— 开机自启没设上"
+                rc=1
+              fi
+            fi
           done
           [ "$rc" = "0" ] && echo "  全部阶段：注入生效且退出码非 0 ✓"
           exit 0
