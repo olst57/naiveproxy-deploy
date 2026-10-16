@@ -41,6 +41,7 @@ chmod +x deploy-naive-caddy.sh && ./deploy-naive-caddy.sh --check --domain 你�
 | `validate-caddyfile.sh` | 安全校验 Caddyfile 的辅助工具（见 [`docs/windows-validation.md`](docs/windows-validation.md)） |
 | `examples/Caddyfile` | 服务端配置示例（**脚本运行时不读它**，仅供人工参考） |
 | `examples/client-config.json` | 客户端配置示例 |
+| `docs/Execution-Flow.md` | 执行路径与运行逻辑（命令敲下去之后依次发生了什么，含阶段、入口、退出码、文件落点） |
 | `docs/VERIFICATION.md` | 验证记录与计划（真机结果、已验证范围、未覆盖项） |
 | `CHANGELOG.md` | 版本变更记录 |
 
@@ -378,6 +379,7 @@ sudo ./deploy-naive-caddy.sh --collect-diagnostics  # 出问题时收集信息
 
 ## 验证与变更记录
 
+- **命令敲下去之后依次发生了什么**（阶段 / 入口 / 退出码 / 文件落点） → [`docs/Execution-Flow.md`](docs/Execution-Flow.md)
 - **验证记录、真机结果、已验证范围与未覆盖项** → [`docs/VERIFICATION.md`](docs/VERIFICATION.md)
 - **Windows 上校验配置的坑**（`/var/...` 解析、GBK 输出） → [`docs/windows-validation.md`](docs/windows-validation.md)
 - **各版本修了什么** → [`CHANGELOG.md`](CHANGELOG.md)
