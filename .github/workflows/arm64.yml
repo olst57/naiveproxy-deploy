@@ -1,0 +1,177 @@
+# arm64（aarch64）验证 —— 覆盖 x86_64 之外的「源码构建」路径。
+#
+# 为什么单独一个 workflow：
+#   install_caddy_binary() 在 ARCH != x86_64/amd64 时强制走 build_from_source()。
+#   上游 Releases 只发布一个资产 caddy-forwardproxy-naive.tar.xz（x86_64），
+#   所以 arm64 根本没有预编译二进制可下载 —— 只能源码构建。
+#   这条路径此前从未在真 arm64 上执行过（见 docs/VERIFICATION.md「未覆盖」）。
+#
+# 边界（别误读）：
+#   - 本 workflow 只验证「arm64 上能否构建出可用的 caddy 二进制」。
+#   - 它【不】部署、【不】碰任何服务器、【不】验证连通性或抗探测。
+#   - 它跑在 GitHub 托管的 arm64 runner 上，不是生产机。
+#
+# 免费前提：仓库是 public，GitHub 才对 ubuntu-24.04-arm 免费。
+
+name: arm64
+
+on:
+  push:
+    branches: [main, ci/arm64]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-source-build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      SHELLCHECK_VERSION: 0.11.0
+      # 脚本 build_from_source() 的注释：Caddy 2.11.x 用 Go 1.26 构建，
+      # 发行版自带的 Go（Ubuntu 24.04 是 1.22）不足以编译。
+      GO_MIN_MINOR: 26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 0. 证明这是真 arm64（判据 1）
+        run: |
+          echo "uname -m = $(uname -m)"
+          echo "uname -a = $(uname -a)"
+          arch="$(uname -m)"
+          if [ "$arch" != "aarch64" ]; then
+            echo "FAIL 期望 aarch64，实际 ${arch} —— runner 不是 arm64，后面的结论无效"
+            exit 1
+          fi
+          echo "OK  runner 确实是 aarch64"
+
+      - name: 1. 语法检查 bash -n
+        run: |
+          for f in deploy-naive-caddy.sh validate-caddyfile.sh; do
+            bash -n "$f"
+            echo "OK  bash -n $f"
+          done
+
+      - name: 2. shellcheck（锁定 0.11.0，-x -S style；arm64 资产）
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.aarch64.tar.xz"
+          curl -fsSL -o /tmp/sc.tar.xz "$url"
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sc="/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$sc" --version | head -n 2
+          "$sc" -x -S style deploy-naive-caddy.sh validate-caddyfile.sh
+          echo "OK  shellcheck: 0 warnings"
+
+      - name: 3. 离线自检 --self-test（核心门禁，报告实测数字）
+        run: |
+          ./deploy-naive-caddy.sh --self-test
+
+      - name: 4. 安装 Go（脚本要求 1.26+）
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: 5. 断言 Go 版本满足脚本要求
+        run: |
+          go version
+          v="$(go env GOVERSION)"          # 形如 go1.26.1
+          minor="$(printf '%s' "$v" | sed -E 's/^go1\.([0-9]+).*/\1/')"
+          echo "Go minor = ${minor}（要求 >= ${GO_MIN_MINOR}）"
+          if [ -z "$minor" ] || [ "$minor" -lt "$GO_MIN_MINOR" ]; then
+            echo "FAIL Go 版本过低：${v} —— 脚本注释说明这个构建需要 Go 1.26+"
+            exit 1
+          fi
+          echo "OK  Go 版本满足 1.26+"
+
+      - name: 6. 安装 xcaddy（照抄 build_from_source()）
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          ls -l "$HOME/go/bin/xcaddy"
+          "$HOME/go/bin/xcaddy" version || true
+
+      - name: 7. 源码构建（核心：照抄 build_from_source() 的命令）
+        run: |
+          mkdir -p "$RUNNER_TEMP/build"
+          cd "$RUNNER_TEMP/build"
+          start=$SECONDS
+          set -o pipefail
+          "$HOME/go/bin/xcaddy" build --output caddy \
+            --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive \
+            2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          elapsed=$(( SECONDS - start ))
+          echo "构建耗时: ${elapsed}s（rc=${rc}）"
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL 源码构建失败（rc=${rc}），最后 40 行日志："
+            tail -n 40 build.log
+            exit 1
+          fi
+          test -x caddy || { echo "FAIL 构建产物 caddy 不存在或不可执行"; exit 1; }
+          ls -l caddy
+          file caddy || true
+          echo "OK  源码构建完成，耗时 ${elapsed}s"
+
+      - name: 8. 验证二进制（判据 3：forward_proxy 模块必须在）
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          echo "── ./caddy version ──"
+          ./caddy version
+
+          # 正确的模块名是 http.handlers.forward_proxy（下划线）。
+          # 别 grep "forwardproxy"（无下划线）——那是仓库名，不是模块名，
+          # 会永远匹配不到、把成功的构建误判成失败。
+          # 旁证：生产机上已验证可用的 caddy 里，模块名就是 http.handlers.forward_proxy。
+          echo "── ./caddy list-modules | grep -i forward_proxy ──"
+          mods="$(./caddy list-modules | grep -i 'forward_proxy' || true)"
+          echo "$mods"
+          if [ -z "$mods" ]; then
+            echo "FAIL list-modules 里找不到 forward_proxy —— 构建出来的不是 naive 版本"
+            echo "     全部模块名（排查用）:"
+            ./caddy list-modules | grep -i proxy || true
+            exit 1
+          fi
+          # 断言的是确切名字，不是"含 forward_proxy 的任意行"——
+          # 否则 http.reverse_proxy.* 之类的行会让断言变得毫无约束力。
+          if ! echo "$mods" | grep -qx 'http.handlers.forward_proxy'; then
+            echo "FAIL 模块名不是 http.handlers.forward_proxy，实际是: $mods"
+            exit 1
+          fi
+          echo "OK  http.handlers.forward_proxy 模块存在（确切名字已核对）"
+
+      - name: 9. caddy validate（含 forward_proxy 的最小 Caddyfile）
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          cat > Caddyfile <<'EOF'
+          {
+          	order forward_proxy before file_server
+          }
+
+          :8443 {
+          	forward_proxy {
+          		basic_auth testuser testpass
+          		hide_ip
+          		hide_via
+          	}
+          	respond "ok"
+          }
+          EOF
+          echo "── 待校验的 Caddyfile ──"
+          cat Caddyfile
+          echo "── caddy validate ──"
+          ./caddy validate --config Caddyfile --adapter caddyfile
+          echo "OK  含 forward_proxy 的最小配置校验通过"
+
+      - name: 10. 汇总证据
+        if: always()
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          echo "arch      : $(uname -m)"
+          echo "go        : $(go version 2>/dev/null || echo n/a)"
+          if [ -x caddy ]; then
+            echo "caddy     : $(./caddy version)"
+          else
+            echo "caddy     : 未产出（构建失败）"
+          fi
