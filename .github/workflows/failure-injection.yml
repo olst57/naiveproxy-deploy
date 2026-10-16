@@ -75,7 +75,42 @@ jobs:
               -v "$out:/out" \
               naive-failmatrix >/dev/null
 
-            timeout 90 docker exec fm systemctl is-system-running --wait || true
+            # 必须先确认容器的 systemd 真的可用：
+            # 脚本自身（阶段 6/7）重度依赖 systemctl，systemd 没起来的话
+            # 整轮结果都没意义 —— 且注入器自己也用 systemctl，会静默失效。
+            # 2026-10-15 实测踩过：阶段 7 的容器里 systemctl 报
+            # "Failed to connect to bus"，注入白做，矩阵却照记读数。
+            ready=no
+            for i in $(seq 1 60); do
+              st="$(docker exec fm systemctl is-system-running 2>/dev/null || true)"
+              case "$st" in
+                running|degraded) ready=yes; break ;;
+              esac
+              sleep 1
+            done
+            if [ "$ready" != "yes" ]; then
+              echo "！！ 容器 systemd 60 秒内未就绪（最后状态: ${st:-无响应}）"
+              echo "   本阶段结论作废 —— 这是容器环境问题，不是脚本行为"
+              mkdir -p "$out"
+              {
+                echo "STAGE=$s"
+                echo "INJECT_EFFECTIVE=no"
+                echo "NOTE=容器 systemd 未就绪，本轮无效"
+                echo "RC_FIRST=na"
+                echo "RC_RERUN=na"
+                echo "RC_RECOVER=na"
+                echo "HAS_STAGE_BANNER=na"
+                echo "HAS_ERR_GLYPH=na"
+                echo "HAS_FAIL_WORD=na"
+                echo "RERUN_STABLE=na"
+              } >"$out/result.env"
+              cat "$out/result.env"
+              docker rm -f fm >/dev/null 2>&1 || true
+              echo "::endgroup::"
+              continue
+            fi
+            echo "容器 systemd 就绪（状态: $st）"
+
             docker exec -e STAGE="$s" fm bash /opt/fm/harness.sh || true
 
             echo "----- result.env -----"

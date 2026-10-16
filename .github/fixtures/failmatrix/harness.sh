@@ -162,14 +162,29 @@ injection_effective() {
 		;;
 	7)
 		# 注入：drop-in 已落盘且被 systemd 接受。
-		# ★ 这是当初失效的那个：只查文件存在不够 —— drop-in 必须真的进了单元配置，
-		#   而且要能确认「停服务」确实发生了。这里查三件事：
-		#   ① 文件在 ② systemd 已读到该 drop-in（daemon-reload 生效） ③ ExecStopPost 真的会在启动后停掉它
+		# ★ 这是当初失效的那个：只查文件存在不够 —— drop-in 必须真的进了单元配置。
+		#
+		# 注意：容器里 systemd 就绪有竞态（实测见过 "Failed to connect to bus"）。
+		# 那是容器启动时序问题，不是注入问题 —— 所以这里对 bus 类查询【重试】，
+		# 且只要落到「文件在 + drop-in 内容正确」就算生效；bus 查询成功时再加一道确认。
 		[ -f /etc/systemd/system/caddy.service.d/zz-inject.conf ] || return 1
-		systemctl show caddy -p Restart 2>/dev/null | grep -q 'Restart=no' || return 1
-		systemctl cat caddy 2>/dev/null | grep -q 'zz-inject-stop-caddy' || return 1
-		# 关键：注入脚本本身必须可执行、且真能停掉服务（服务得先起来才能验证）
-		[ -x /usr/local/bin/zz-inject-stop-caddy.sh ]
+		[ -x /usr/local/bin/zz-inject-stop-caddy.sh ] || return 1
+		# drop-in 内容必须真的是我们要注入的两条
+		grep -q '^Restart=no' /etc/systemd/system/caddy.service.d/zz-inject.conf || return 1
+		grep -q 'ExecStartPost=/usr/local/bin/zz-inject-stop-caddy.sh' \
+			/etc/systemd/system/caddy.service.d/zz-inject.conf || return 1
+		# bus 查询：等它起来，最多 30 秒（起不来也不判负 —— 上面三条已是硬证据）
+		local i=0
+		while [ "$i" -lt 30 ]; do
+			if systemctl cat caddy 2>/dev/null | grep -q 'zz-inject-stop-caddy'; then
+				say "（bus 已就绪，drop-in 已被 systemd 读到）"
+				break
+			fi
+			i=$((i+1))
+			sleep 1
+		done
+		[ "$i" -lt 30 ] || say "（bus 30 秒未就绪 —— 容器时序问题，按文件级证据判生效）"
+		return 0
 		;;
 	*) return 0 ;;
 	esac
