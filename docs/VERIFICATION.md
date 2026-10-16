@@ -105,6 +105,9 @@ Alpine / openrc 路径、arm64 的 `--build-from-source`、以及失败注入矩
 ### 未覆盖（重要，别当成已验证）
 
 - **Alpine + openrc 路径**（含 busybox `sed`/`ss` 缺失场景）
+  —— CI 作业 `.github/workflows/alpine-openrc.yml` 已就位（真 `alpine:3.20` 容器），
+  **但截至本次提交尚未跑过**。在该作业出结果之前，这一行**仍算未验证**，
+  不要因为「CI 文件存在」就当成已验证。
 - **arm64 的 `--build-from-source`**（上游无 arm64 资产，推理为大概率失败）
 - **失败注入矩阵**（故意占端口、故意破坏状态文件、伪造域名不解析、打断下载）
 - `forward_proxy` 子指令在真机上的**运行行为**（`hide_ip` 是否真摘掉 `Forwarded`、`ports` 白名单是否真拦端口）
