@@ -131,12 +131,13 @@ jobs:
         run: |
           set -uo pipefail
           all=/tmp/fm-all
-          printf '| 阶段 | 注入生效 | 退出码(首次) | 重跑 | 撤销注入后重跑 | 阶段失败横幅 | ✗ 错误行 | 重跑稳定 |\n'
+          printf '| 阶段 | 注入生效 | 退出码(首次) | 重跑 | 撤销已清 | 撤销后重跑 | 阶段失败横幅 | ✗ 错误行 |\n'
           printf '| --- | --- | --- | --- | --- | --- | --- | --- |\n'
           for s in 1 2 3 4 5 6 7; do
             f="$all/stage-$s/result.env"
             if [ ! -f "$f" ]; then
-              printf '| %s | **(夹具没产出结果)** | ? | ? | ? | ? | ? | ? |\n' "$s"
+              # 8 列：阶段 | 注入生效 | 首次 | 重跑 | 撤销已清 | 撤销后 | 横幅 | 错误行
+              printf '| %s | **(没产出结果)** | ? | ? | ? | ? | ? | ? |\n' "$s"
               continue
             fi
             # shellcheck disable=SC1090
@@ -144,9 +145,12 @@ jobs:
               # 注入没打中 ⇒ 本行读数无意义，要一眼能看出来，别混在正常行里。
               mark="$INJECT_EFFECTIVE"
               [ "$mark" = "no" ] && mark="**否 ⇒ 本行不可信**"
+              # 撤销没清干净 ⇒ 「撤销后重跑」那格读数无意义（不等于脚本不可恢复）
+              lc="${LIFT_CLEAN:-na}"
+              [ "$lc" = "no" ] && lc="**否 ⇒ 右侧读数不可信**"
               printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-                "$STAGE" "$mark" "$RC_FIRST" "$RC_RERUN" "$RC_RECOVER" \
-                "$HAS_STAGE_BANNER" "$HAS_ERR_GLYPH" "$RERUN_STABLE" )
+                "$STAGE" "$mark" "$RC_FIRST" "$RC_RERUN" "$lc" "$RC_RECOVER" \
+                "$HAS_STAGE_BANNER" "$HAS_ERR_GLYPH" )
           done
 
           echo

@@ -210,7 +210,26 @@ lift() {
 		[ -f /root/curl.hidden ] && mv -f /root/curl.hidden /usr/bin/curl
 		;;
 	2)
-		sed -i '/127\.0\.0\.1 \(github\.com\|api\.github\.com\|objects\.githubusercontent\.com\)/d' /etc/hosts
+		# 撤销必须【精确匹配整行】。
+		# 原来写的是 sed '/127\.0\.0\.1 \(github\.com\|…\)/d' —— 两个错误：
+		#   ① 在 BRE 里 \( \) 是【分组符】不是字面括号，那个模式永远匹配不到；
+		#   ② 即使匹配到，也只删了含该子串的行，末尾换行/空白残留。
+		# 结果：hosts 里的注入行没被删掉，脚本重跑照样连不上 github，
+		# 矩阵因此把「撤销后仍失败」误读成「脚本不可恢复」。
+		# 实测证据：stage-2/run-c.log 里 curl 报
+		#   "Failed to connect to github.com port 443: Connection refused"
+		# —— 注入明明该撤了。
+		# 改成按整行（锚定 ^…$）删，且用 -F 的等价写法逐行过滤，不依赖 BRE 分组。
+		grep -vxF '127.0.0.1 github.com' /etc/hosts >/etc/hosts.clean 2>/dev/null || true
+		grep -vxF '127.0.0.1 api.github.com' /etc/hosts.clean >/etc/hosts.clean2 2>/dev/null || true
+		grep -vxF '127.0.0.1 objects.githubusercontent.com' /etc/hosts.clean2 >/etc/hosts 2>/dev/null || true
+		rm -f /etc/hosts.clean /etc/hosts.clean2
+		# 撤销后自证：残留必须为 0，否则明说（不让它静默污染后续读数）
+		if grep -qE '^127\.0\.0\.1[[:space:]]+(github\.com|api\.github\.com|objects\.githubusercontent\.com)$' /etc/hosts 2>/dev/null; then
+			say "！！ 阶段 2 撤销失败：/etc/hosts 里仍有注入行 —— run-c 读数不可信"
+		else
+			say "阶段 2 撤销自证：hosts 注入行已清零"
+		fi
 		;;
 	3) rm -f /etc/caddy ;;
 	4) rm -rf /etc/caddy/Caddyfile ;;
@@ -287,6 +306,7 @@ main() {
 	say "注入完成"
 
 	local rc_a rc_b rc_c
+	local LIFT_CLEAN=na
 	rc_a=$(run_deploy "$OUT/run-a.log"); residue >"$OUT/residue-a.txt"
 	say "第一次退出码 = $rc_a"
 
@@ -296,6 +316,17 @@ main() {
 
 	say "撤销注入后重跑"
 	lift
+	# lift 后自证注入确实撤销了（injection_effective 现在应当为【假】）。
+	# 不做这步的话，「撤销没清干净」会被误读成「脚本不可恢复」——
+	# 2026-10-15 阶段 2 就是这么被误判的（sed 正则里的 \( \) 没匹配上，
+	# hosts 注入行留着，重跑照样连不上 github，退出码 1 被记成「不可恢复」）。
+	if injection_effective 2>/dev/null; then
+		say "！！ 撤销自证失败：注入特征仍在 —— run-c 的读数不可信（lift 没清干净）"
+		LIFT_CLEAN=no
+	else
+		say "撤销自证：注入特征已清除"
+		LIFT_CLEAN=yes
+	fi
 	rc_c=$(run_deploy "$OUT/run-c.log"); residue >"$OUT/residue-c.txt"
 	say "恢复跑退出码 = $rc_c"
 
@@ -314,6 +345,7 @@ main() {
 		echo "HAS_ERR_GLYPH=$glyph"
 		echo "HAS_FAIL_WORD=$failmsg"
 		echo "RERUN_STABLE=$([ "$rc_a" = "$rc_b" ] && echo yes || echo no)"
+		echo "LIFT_CLEAN=$LIFT_CLEAN"
 	} >"$OUT/result.env"
 	cat "$OUT/result.env"
 }
