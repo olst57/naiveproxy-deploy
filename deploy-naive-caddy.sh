@@ -65,6 +65,7 @@
 #     ～ 主流程
 #     ～ 自检用的顶层辅助
 #     ～ 退出码 2 的行为级断言辅助
+#     ～ do_check 的沙箱（退出码判定专用）
 #     ～ 开发者自检
 #     ～ 子集过滤（--self-test <模式>）
 # ST_INDEX_END
@@ -525,6 +526,9 @@ NaiveProxy 服务端部署脚本 v2.6.1
   0  成功；按回车主动取消；或显式用了 --skip-verify
   1  失败 —— 参数不合法、环境不满足、或部署中某个阶段没通过。
      这时摘要不会打印，密码和客户端配置也不会生成。
+     另外，--check 体检发现需要先处理的问题时也退 1：这样
+     `if ./deploy-naive-caddy.sh --check; then` 才真的代表体检通过。
+     体检本身仍然是只读的，退 1 只是「有情况」，不是「跑失败了」。
   2  部署已经完成 —— 密码与 client-config.json 都照常打印，
      只是阶段 7 的验证里有几项没能当场确认（本机 HTTPS 握手 / 证书信息 /
      代理转发实测 / 公网可达）。最常见的原因是证书还在签发中，
@@ -1602,8 +1606,16 @@ check_ports_free() {
 				ok "端口 ${p} 空闲"
 				;;
 			*)
-				note "端口 ${p}：本机没有 ss 命令，无法判定，请自行确认"
+				# 与本函数 in-use 分支里那句「仍然继续？」同格：两者都是「我无法
+				# 确认这个端口能给你用」，处置也必须同级 —— 让用户确认后再继续，
+				# 而不是 note 一行就放过。
+				# 刻意不写行号：这个项目里写死的行号改一次文件就漂一次，
+				# 索引里的 index_has_line_numbers 断的就是这件事。
+				# 口径与 do_check 的端口 *) 分支一致（那边计入 problems、退非 0），
+				# 否则同一台机器上 preflight 与 --check 会给出不同裁决。
+				warn "端口 ${p}：本机没有 ss 命令，无法判定是否被占用"
 				note "  装上就能自动查：apt install iproute2（或 dnf install iproute / apk add iproute2）"
+				[ "$ASSUME_YES" = "yes" ] || confirm "仍然继续？"
 				;;
 		esac
 	done
@@ -2708,8 +2720,12 @@ do_check() {
 			ok "端口 ${p} 空闲"
 			;;
 		*)
-			note "端口 ${p}：本机没有 ss 命令，无法判定（不算问题，但请自行确认）"
-			note "  装上就能自动查：apt install iproute2"
+			# 「我查不了」≠「可以装」。原先这里只 note 一行、不计入 problems，
+			# 于是没有 ss 的机器会拿到「没发现问题，可以正式部署了」——
+			# 而它连 80/443 被谁占着都不知道。
+			warn "端口 ${p}：本机没有 ss 命令，无法判定是否被占用"
+			info "  ${G_ARROW} 装一个就能自动查：apt install iproute2（或 dnf install iproute / apk add iproute2）"
+			problems=$((problems + 1))
 			;;
 		esac
 	done
@@ -2785,6 +2801,17 @@ do_check() {
 		warn "有 ${problems} 项需要先处理（上面标 ${G_WARN} 的）。处理完再跑一次 --check 复查。"
 	fi
 	printf '\n%s\n\n' "  ${C_DIM}体检是只读的 —— 刚才没有改动这台机器上的任何东西。${C_RST}"
+
+	# 有 N 项问题就退 1，干净才退 0。
+	# 以前这里什么都不返回，于是 `--check` 恒退 0 —— 用户拿到「有 1 项需要先处理」
+	# 却看到一个成功的退出码，`if ./deploy.sh --check; then` 会当体检通过。
+	# 为什么不 `return "$problems"`：bash 的返回值是 uint8，计数一过 255 就被截断
+	# （256 → 0），那正好把「有一堆问题」翻成「没问题」—— 与本条修复的方向相反。
+	# 退出码这一层只需要「有没有问题」，条数在结论行里已经写清楚了。
+	if [ "$problems" -gt 0 ]; then
+		return 1
+	fi
+	return 0
 }
 
 # ---------------- 重载 / 升级 ----------------
@@ -3024,7 +3051,10 @@ main() {
 		if ! validate_path_value "$WEB_ROOT"; then
 			die "--web-root 不合法: ${WEB_ROOT}（不能含空格、引号、换行等字符）"
 		fi
-		do_check
+		# 显式传播 do_check 的裁决，不依赖 set -e 的隐式行为：
+		# 体检发现问题（problems > 0）时 --check 必须退非 0，否则「有问题」
+		# 和「没问题」在退出码上分不开，脚本化的调用方会把体检当通过。
+		do_check || return 1
 		return 0
 	fi
 
@@ -3380,6 +3410,266 @@ _verify_exit_sandbox() { # <main 调用体> —— 在剥掉 main "$@" 的副本
 # 桩写两遍就有漂移风险，而这里漂移了会让某条断言悄悄测不到真东西。
 _verify_exit_rc() { # <main 调用体>
 	_verify_exit_sandbox "$1" | sed -n 's/.*__RC__//p' | tail -1
+}
+
+# ---------------- do_check 的沙箱（退出码判定专用） ----------------
+# 报错两行：第一行是调用方的 <期望>，第二行是「实得」。分开是因为调用方要贴的
+# 期望值往往自带括号说明，全塞进一行读起来糊成一团。
+_ck_report() { # <函数名> <期望> <实得>
+	local fn="$1" want="$2" got="$3"
+	printf '  期望 %s。实得: %s\n' "$want" "${got:-（读不到退出码）}" >&2
+	return 1
+}
+
+# 剥掉尾部的 `main "$@"` 后 source，再由调用方自己调 main —— 与
+# _verify_exit_sandbox 同源，只是桩集不一样：do_check 是只读体检，不吃 root、
+# 不碰磁盘，真正会跟机器较劲的只有「网络 / 端口 / 磁盘」三类探测。
+#
+# 三个探测一律桩掉（这是本批次最要紧的约束）：
+#   · port_state     —— 本机没有 ss、ubuntu CI 有、alpine CI 没有。断言如果有
+#                       一次真的读到宿主环境，就会变成「ubuntu 绿、Alpine 红」。
+#                       桩成 free 之后，判据完全由断言自己给定。
+#                       注意桩【要真实】：早先我把 need_cmd 也桩成失败，本意是
+#                       模拟「没有 ss」，结果 do_check 根本没走到 `! need_cmd ss`
+#                       那条分支（port_state 整个被桩掉了），三态逻辑一次都没测到。
+#                       现在桩只覆盖三态取值，端口判定仍由真实 port_state 决定；
+#                       要测「没 ss」就在 $call 里 `unset -f port_state`（见
+#                       check_problems_unknown_when_ss_missing）。
+#   · get_public_ip / resolve_domain_ip —— 真联网有超时、有 DNS 缓存、有
+#                       代理干扰；桩成同一个 IP 才好断言「解析正确」。
+#   · curl           —— 源码里是裸调 `curl`（不是 need_cmd curl，也不是变量
+#                       转调），所以直接定义同名函数就能盖住。
+#   · df             —— 直接在提示符上跑，主机磁盘大小会决定「够不够 200MB」，
+#                       不桩掉这条断言就绑死在 CI runner 的磁盘上。
+#   · detect_os/detect_arch —— 只影响打印的那行 info，桩掉省掉读 /etc/os-release。
+#
+# 刻意【不】桩 check_tls_cert_inputs / validate_cert_options / report_cert_plan：
+# 那三个是 do_check 的真身逻辑（证书配对、cert-mode 取值、续期机制判定），
+# 桩掉就等于不测了。它们在沙箱里都是只读的，能真跑。
+#
+# 只剥尾部那行 `main "$@"`，与 _verify_exit_sandbox 一致：source 只定义函数不执行，
+# 退出码由调用方自己调 main 拿。self_test 虽然也被一并 source 进来，但沙箱走的是
+# `main --check` 这条路径，碰不到它，不存在自检套自检的问题。
+_do_check_sandbox() { # <main 调用体> —— 打印 "__RC__<退出码>" + 一行体检结论
+	local call="$1" lib="" out="" rc=0
+	lib=$(mktemp) || return 1
+	grep -vxF 'main "$@"' "$0" > "$lib" || { rm -f "$lib"; return 1; }
+	out=$(bash -c '
+		source "$1" 2>/dev/null || exit 97
+		detect_os()   { OS_NAME="test-os"; INIT="systemd"; PKG="apt"; return 0; }
+		detect_arch() { ARCH="x86_64"; return 0; }
+		get_public_ip()     { printf "%s" "${STUB_IP:-1.2.3.4}"; return 0; }
+		resolve_domain_ip() { printf "%s" "${STUB_IP:-1.2.3.4}"; return 0; }
+		# 注意 ${STUB_PORT_STATE:-free}：调用方用环境变量就能改三态，
+		# set -u 下必须有默认值，否则未设就是「未定义变量」直接报错。
+		# 这是【默认】桩：要跑真实的三态判定，调用方 `unset -f port_state` 即可。
+		port_state() { printf "%s" "${STUB_PORT_STATE:-free}"; return 0; }
+		need_cmd() { return 0; }
+		curl() { return 0; }
+		df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 100000000 1 99999999 1%% /\n"; return 0; }
+		trap - EXIT
+		rc=0
+		eval "$2" || rc=$?
+		printf "__RC__%s\n" "$rc"
+	' _ "$lib" "$call" 2>&1) || rc=$?
+	rm -f "$lib"
+	if [ "$rc" -eq 97 ]; then
+		printf '  子 shell 里 source 主脚本失败（脚本自身有问题）\n' >&2
+		return 1
+	fi
+	# 子 shell 自带一个 rc：source 失败才是 97，其余非 0 都被 `|| rc=$?` 吃掉了。
+	# 这里只把 stdout 原样交给调用方 —— 里面已经带 __RC__ 行。
+	printf '%s\n' "$out"
+	return 0
+}
+
+# 只要退出码的那一层（与 _verify_exit_rc 同构）。
+_do_check_rc() { # <main 调用体>
+	_do_check_sandbox "$1" | sed -n 's/.*__RC__//p' | tail -1
+}
+
+# ---- 行为级：--check 的退出码必须跟着「有没有问题」走 ----
+# 这条是本批次 A2 的核心。原来 do_check 走到底什么都不返回，于是
+# `--check` 恒退 0 —— 用户拿到「有 1 项需要先处理」，脚本化的调用方却当体检通过。
+# 必须真跑出那个数字：源码里写了 return 1 不等于真退 1（本项目反复踩过）。
+
+# A2-a) 有确定的问题时退 1。
+# 只造一个问题、其余全桩成健康：这样退出码的成因是唯一的，
+# 断言红了直接就知道是哪一项在拖后腿。
+# 走桩而不是走真实环境：本机没有 ss，真实环境里 80/443 两条会自动变成问题，
+# 那样这条断言在新机器上（有 ss）会变成 0 项问题 → 退 0 → 假红。
+check_exits_1_when_problems() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	# 期望里写清场景：DNS 指向别的机器，且注明端口已桩成空闲 ——
+	# 否则看到「实得 0」的人会以为是端口没查出来。
+	_ck_report check_exits_1_when_problems '有 1 项（域名解析不符，端口已桩成空闲）时退出 1' "$got"
+	printf '  体检结论行：%s\n' "$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)" >&2
+	return 1
+}
+
+# A2-b) 干净环境必须退 0 —— 护栏，专防「一刀切退 1」。
+# 没有这条，把 do_check 改成无条件 `return 1` 也能让上面那条绿。
+# 这里六类探测全部给健康值，问题数必须是 0。
+check_exits_0_when_clean() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "0" ]; then
+		return 0
+	fi
+	_ck_report check_exits_0_when_clean '干净环境（解析相符 / 端口空闲 / GitHub 通 / 磁盘足 / 非 root）退出 0' "$got"
+	printf '  体检结论行：%s\n' "$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)" >&2
+	return 1
+}
+
+# A2-c) 判据必须真的是「problems 计数」，不是「端口能不能查」。
+# 这一条是 B1.2（G）的行为级复核：同一台机器，唯一变量是 port_state 的三态。
+#   free  → 端口不算问题
+#   in-use（占用者不是 caddy）→ 算 3 条问题（80/443 + 自定义端口各一条）
+# 若有人把 G 改回去（unknown 只 note 不计 problems），上面的 0 仍然成立、
+# 这条也仍然成立 —— 所以还要有 check_problems_unknown_when_ss_missing 兜底。
+# 两条合起来才把「三态 → 计数 → 退出码」这条链锁死。
+check_problems_track_port_state() {
+	_self_test_nested_skip && return 0
+	local out="" got=""
+	out=$(_do_check_sandbox '
+		STUB_PORT_STATE=in-use
+		port_owner_is_caddy() { return 1; }
+		show_port_owner() { return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	_ck_report check_problems_track_port_state '端口被占（占用者不是 caddy）时退出 1' "$got"
+	return 1
+}
+
+# G-a) 行为级：ss 缺失时「查不了」必须计入 problems。
+# 桩掉 need_cmd 让 `need_cmd ss` 失败 —— port_state 于是返回 unknown。
+# 这是本机（无 ss）与 alpine CI（无 iproute2）的真实情形。
+# 期望必须是 1：原先 unknown 只 note 一行，problems 是 0，于是退 0 并打出
+# 「没发现问题，可以正式部署了」—— 而那台机器连 80/443 被谁占着都不知道。
+check_problems_unknown_when_ss_missing() {
+	_self_test_nested_skip && return 0
+	local out="" got="" verdict=""
+	out=$(_do_check_sandbox '
+		# 把默认的 port_state 桩撤掉，让真实的 port_state 来判断；
+		# 再让 need_cmd ss 失败 —— 于是真实 port_state 返回 unknown。
+		# 这才真的走到了 do_check 的 *) 分支（第一版把 need_cmd 桩成失败
+		# 但同时留着 port_state 桩，三态逻辑一次都没测到）。
+		unset -f port_state
+		need_cmd() { case "$1" in ss) return 1 ;; *) return 0 ;; esac; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	got=$(printf '%s\n' "$out" | sed -n 's/.*__RC__//p' | tail -1)
+	verdict=$(printf '%s\n' "$out" | grep -oE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理' | tail -1)
+	if [ "$got" = "1" ]; then
+		return 0
+	fi
+	_ck_report check_problems_unknown_when_ss_missing 'ss 缺失（端口判不出）时退出 1，不是 0' "$got"
+	printf '  体检结论行：%s\n' "${verdict:-（没读到结论行）}" >&2
+	return 1
+}
+
+# G-b) 结构级：do_check 的端口 *) 分支必须真的把 problems 加上去。
+# 为什么还要结构断言 —— 上面的行为断言桩掉了 need_cmd，只覆盖「need_cmd 失败」
+# 这一条路径；而 `case "$(port_state "$p")"` 还有别的落进 *) 的方式
+# （比如 port_state 返回了第四种值）。结构断言盯的是源码里那一行本身：
+# 少了 `problems=`，任何人把 G 改回去都立刻红。
+# 用 fn_code（剥注释）：「这里必须 problems++」这句解释性注释不算数 ——
+# 否则把真代码删掉、注释留着，断言依然绿（本项目实测过这种假绿）。
+check_ports_branch_has_problems() {
+	local body=""
+	# sed 取从 `*)` 到 `;;` 的那一段：端口循环里 in-use 分支的内层也用了
+	# `;;`，所以用非贪婪的首次匹配，取到的就是 *) 分支本体。
+	# awk 更贴切：按 case 分支缩进取。这里用 sed 的地址范围，
+	# 因为确实存在跨行的 `;;` 边界（实测：端口循环的 *) 有一行注释 + warn + note + problems++）。
+	body=$(fn_code do_check | awk '
+		/^[[:space:]]*\*\)[[:space:]]*$/ { grab = 1 }
+		grab { print }
+		grab && /^[[:space:]]*;;[[:space:]]*$/ { exit }
+	')
+	if printf '%s' "$body" | grep -qE 'problems='; then
+		return 0
+	fi
+	printf '  do_check 的端口 *) 分支里没有 problems= —— unknown 又被当成「没问题」了。\n' >&2
+	printf '  该分支实际内容：\n%s\n' "$body" >&2
+	return 1
+}
+
+# G-c) 结构级：check_ports_free 的 *) 分支必须与同函数里「端口被占」那个分支同格。
+# 两处口径必须一致，否则同一台机器上 preflight 与 --check 会给出不同裁决：
+# --check 说「有问题」，preflight 却一声不响地放过去。
+# 断言必须绑在「结构」而不是「恰好有 confirm 这个词」上 ——
+# confirm 必须出现在 *) 分支里，且必须受 ASSUME_YES 管辖。
+check_preflight_ports_branch_guarded() {
+	local body=""
+	body=$(fn_code check_ports_free | awk '
+		/^[[:space:]]*\*\)[[:space:]]*$/ { grab = 1 }
+		grab { print }
+		grab && /^[[:space:]]*;;[[:space:]]*$/ { exit }
+	')
+	if ! printf '%s' "$body" | grep -qE 'ASSUME_YES'; then
+		printf '  check_ports_free 的端口 *) 分支没受 ASSUME_YES 管辖 —— 无人值守部署会被卡住。\n' >&2
+		printf '  该分支实际内容：\n%s\n' "$body" >&2
+		return 1
+	fi
+	if ! printf '%s' "$body" | grep -qE 'confirm[[:space:]]'; then
+		printf '  check_ports_free 的端口 *) 分支没有 confirm —— 「查不了」又被 note 一行放过了。\n' >&2
+		printf '  该分支实际内容：\n%s\n' "$body" >&2
+		return 1
+	fi
+	return 0
+}
+
+# ---- 只读性：--check 有问题时改的也只是退出码，不是这台机器 ----
+# 与 [11] 里那条「--check 无需 root 即可完成」是同一件事的两面：
+# 那边断「跑得完」，这边断「发现问题也没退化成跑不完」。
+check_problems_still_completes_readonly() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	# 取的是沙箱里 main 的真实退出码（stdout 的 __RC__ 行），不是
+	# `$(...)` 这个命令替换本身的 rc —— 后者恒为 0，拿它跟 126/127 比
+	# 永远不成立，等于这条保护是空的（第一版就是这么写错的）。
+	rc=$(_do_check_rc '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	# 126 = 命令不可执行、127 = 找不到命令：这两个码说明 --check 在沙箱里
+	# 连体检都没跑起来（例如脚本被改成需要 root 才能执行）。
+	# 退 1 是「体检发现问题」，不是「跑不动」—— 这两者必须分得开。
+	if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+		printf '  --check 在沙箱里没能跑起来（退出码 %s，像是指令找不到/不可执行）。\n' "$rc" >&2
+		return 1
+	fi
+	# 结论行必须打出来：有问题也要走完整个体检，而不是撞到第一项就退出。
+	# 这里重跑一次沙箱只取输出 —— 与上面那次共用同一组桩，判据一致。
+	out=$(_do_check_sandbox '
+		get_public_ip()     { printf "%s" "1.2.3.4"; return 0; }
+		resolve_domain_ip() { printf "%s" "9.9.9.9"; return 0; }
+		main --check --domain a.example.com --email o@m.test
+	')
+	if ! printf '%s' "$out" | grep -qE '没发现问题，可以正式部署了|有 [0-9]+ 项需要先处理'; then
+		printf '  --check 有问题时没打出结论行 —— 体检中途退出了？\n' >&2
+		return 1
+	fi
+	return 0
 }
 
 # 行为级：部署完成但验证有 warning 时，main 的退出码必须是 2（不是 0）。
@@ -4040,14 +4330,28 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 
 	before=$(find "${CONF_DIR}" "${CADDY_BIN}" -maxdepth 1 2>/dev/null | sort | tr '\n' ' ' || true)
 	out=$(bash "$0" --check --domain a.example.com --email ops@mail.test 2>&1 || true)
-	true_case "--check 无需 root 即可完成" bash "$0" --check --domain a.example.com --email ops@mail.test
+	# 原本这里是 true_case（期望退 0）。A2 之后 --check 发现问题就退 1，
+	# 而 a.example.com 在真实环境里必然有问题（没有 ss / DNS 不符），
+	# 继续期望 0 会让这条在每台机器上假红。
+	# 语义不能退化成「必然失败」—— 这条要断的是「无需 root 即可完成」，
+	# 所以改断「完成」而不是「退 0」：不退 126/127（指令找不到 / 不可执行）、
+	# 不退化成 root 拦截，且真的打出了体检结论（撞到第一项就退出就打不出结论）。
+	# 用 rc_case 表达「不是某两个码」：期望 1 恰好把 126/127 排除掉 ——
+	# 真实环境里 a.example.com 必然有问题，所以 1 就是这里的确定值；
+	# 干净环境退 0 由 [21] 的 check_exits_0_when_clean 在沙箱里锁住。
+	rc_case "--check 无需 root 即可完成（不退 126/127）" 1 \
+		bash "$0" --check --domain a.example.com --email ops@mail.test
+	true_case "--check 不要求 root（没打出管理员权限提示）" \
+		not_has "$out" '这一步需要管理员权限'
 	true_case "--check 输出体检结论" has "$out" '结论'
 	false_case "--check 不凭空生成密码（曾会打印一个假密码）" has "$out" '已自动生成'
 	true_case "--check 密码位置显示占位符" has "$out" '部署时自动生成'
 	false_case "--check 不打印任何真实密码形态" has "$out" 'basic_auth tom [A-Za-z0-9]{8,}'
 	local aout=""
 	aout=$(NAIVE_ASCII=1 bash "$0" --check --domain a.example.com 2>&1 || true)
-	true_case "ASCII 模式可用（老终端兜底）" env NAIVE_ASCII=1 bash "$0" --check --domain a.example.com
+	# 同上面那条：A2 之后 --check 发现问题退 1，这里断「跑得完」而不是「退 0」。
+	rc_case "ASCII 模式可用（老终端兜底，不退 126/127）" 1 \
+		env NAIVE_ASCII=1 bash "$0" --check --domain a.example.com
 	false_case "ASCII 模式下不出现 UTF-8 标记" has "$aout" '✓'
 	# 断言必须绑在"与外部工具无关"的字形上：
 	# 之前绑的是 "+ 端口 …空闲"，而端口探测改成三态后，
@@ -4358,7 +4662,16 @@ SSLCNF
 			true_case "匹配的证书/私钥被接受" validate_tls_cert_pair "${cdir}/c.pem" "${cdir}/k.pem"
 			false_case "写反（证书当私钥）被拒绝" validate_tls_cert_pair "${cdir}/c.pem" "${cdir}/c.pem"
 			false_case "体检拒绝写反的证书对" bash "$0" --check --domain a.example.com --email o@m.test --tls-cert "${cdir}/c.pem" --tls-key "${cdir}/c.pem"
-			true_case "--tls-cert= 等号形式可用" bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem"
+			# 这条要断的是「等号形式能被解析」，不是「体检结论为通过」——
+			# A2 之后 --check 发现问题就退 1，拿 0 当期望会在每台机器上假红。
+			# 用 rc_case 期望 1：既证明等号形式没被当成非法参数（那会是 1，
+			# 但同时也打不出体检结论），又排除了 126/127。是否真的接受，
+			# 由下面那条「参数被接受、走得进体检」的断言补上。
+			rc_case "--tls-cert= 等号形式可用（不退 126/127）" 1 \
+				bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem"
+			true_case "--tls-cert= 等号形式被接受（未退化成参数错）" \
+				not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --tls-cert="${cdir}/c.pem" --tls-key="${cdir}/k.pem" 2>&1 || true)" \
+				'参数不合法|必须同时给出'
 		else
 			skip_case "证书配对行为断言（本机 openssl 签不出证书）"
 		fi
@@ -4595,9 +4908,22 @@ SSLCNF
 	false_case "体检拒绝 --cert-mode file 却无文件" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode file
 	false_case "体检拒绝 --cert-mode acme 却无 token" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode acme
 	false_case "体检拒绝不存在的 token 文件" bash "$0" --check --domain a.example.com --email o@m.test --cf-token-file /nonexistent/cf
-	true_case "体检接受 auto 模式（无 token 时退 caddy）" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto
-	true_case "体检默认就是 auto" bash "$0" --check --domain a.example.com --email o@m.test
-	true_case "--acme-staging 被接受" bash "$0" --check --domain a.example.com --email o@m.test --acme-staging
+	# 这三条断的是「参数被接受」，不是「体检结论为通过」。
+	# A2 之后 --check 发现问题退 1，所以改断「走得进体检、没被参数校验拦下」：
+	# 真被拦下时打的是「参数不合法 / 必须同时给出」这类 die 文案，而不是体检结论。
+	# 期望码 1 同时排除了 126/127（指令找不到 / 不可执行）。
+	rc_case "体检接受 auto 模式（无 token 时退 caddy）" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto
+	true_case "体检接受 auto 模式（确实走进了体检，未退化成参数错）" \
+		not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --cert-mode auto 2>&1 || true)" '参数不合法|cert-mode.*非法'
+	rc_case "体检默认就是 auto" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test
+	true_case "体检默认就是 auto（确实走进了体检）" \
+		has "$(bash "$0" --check --domain a.example.com --email o@m.test 2>&1 || true)" '结论'
+	rc_case "--acme-staging 被接受" 1 \
+		bash "$0" --check --domain a.example.com --email o@m.test --acme-staging
+	true_case "--acme-staging 被接受（确实走进了体检）" \
+		not_has "$(bash "$0" --check --domain a.example.com --email o@m.test --acme-staging 2>&1 || true)" '未知参数|不合法'
 	# --cert-mode= 等号形式（与 --tls-cert= 同源的一致性要求）
 	false_case "cert-mode= 等号形式同样生效" bash "$0" --check --domain a.example.com --email o@m.test --cert-mode=bogus
 
@@ -4691,6 +5017,38 @@ SSLCNF
 	true_case "usage 说明 --skip-verify 记 0" has "$(fn_body usage)" 'skip-verify.*退出码仍记 0'
 	true_case "usage 说明 2 表示部署已完成" has "$(fn_body usage)" '部署已经完成'
 	true_case "usage 说明 2 不是参数写错" has "$(fn_body usage)" '参数写错了'
+
+	fi
+	# ---- 21) --check 的诚实退出码 + unknown 端口（BATCH B1 新增）----
+	# 本节纯新增，上面 410 条一行没动。
+	# 全部走 _do_check_sandbox：本机没有 ss、ubuntu CI 有、alpine CI 没有 ——
+	# 断言只要有一次真的读到宿主环境，就会变成「ubuntu 绿、Alpine 红」。
+	# 沙箱把 port_state 桩成三态可控，判据完全由断言自己给定。
+	if st_want 21; then
+	printf '\n[21] --check 的诚实退出码 + unknown 端口（BATCH B1）\n'
+
+	# ---- 21a) A2：退出码必须跟着「有没有问题」走 ----
+	true_case "有问题时 --check 退 1（原 bug 是 0）" check_exits_1_when_problems
+	# 护栏：没有这条，把 do_check 改成无条件 return 1 也能让上面那条绿。
+	true_case "干净环境 --check 退 0（防一刀切退 1）" check_exits_0_when_clean
+	true_case "端口被占时 --check 退 1" check_problems_track_port_state
+	# 只读性：有问题也只是退出码变了，体检本身照样跑完（不退化成 126/127）。
+	true_case "--check 发现问题时仍走完体检（只读）" check_problems_still_completes_readonly
+
+	# ---- 21b) G：unknown 不许再被当成「没问题」 ----
+	# 行为级：本机与 alpine CI 的真实现状（没有 ss）。
+	true_case "ss 缺失时 --check 退 1（查不了≠可以装）" check_problems_unknown_when_ss_missing
+	# 结构级：行为断言桩掉了 need_cmd，只覆盖这一条路径；
+	# 结构断言直接盯源码里那一行，谁把 problems++ 删掉都立刻红。
+	true_case "do_check 端口 *) 分支计入 problems" check_ports_branch_has_problems
+	# 两处口径必须一致，否则 preflight 与 --check 对同一台机器裁决不同。
+	true_case "preflight 端口 *) 分支同格（受 --yes 管辖的 confirm）" check_preflight_ports_branch_guarded
+
+	# ---- 21c) 文案：usage 要说清「1 也可以表示体检发现问题」 ----
+	# 退出码帮助段不写这一句，下一个人看到 --check 退 1 会去查参数，
+	# 而参数根本没问题 —— 正是本项目一直在防的「误导性诚实」。
+	true_case "usage 说明 1 也表示体检发现问题" has "$(fn_body usage)" '体检发现'
+	true_case "usage 说明 --check 退 1 不等于跑失败" has "$(fn_body usage)" '不是「跑失败了」'
 
 	fi
 # ST_ASSERT_END
