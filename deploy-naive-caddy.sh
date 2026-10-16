@@ -71,7 +71,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 CADDY_FALLBACK_TAG="v2.11.7-naive"
 GH_REPO="klzgrad/forwardproxy"
 CADDY_BIN="/usr/bin/caddy"
@@ -438,7 +438,7 @@ run_stage() { # <序号> <函数...>
 # ---------------- 帮助与引导 ----------------
 usage() {
 	cat <<'USAGE'
-NaiveProxy 服务端部署脚本 v2.6.0
+NaiveProxy 服务端部署脚本 v2.6.1
 把这台服务器变成一台 NaiveProxy 服务端（Caddy + 伪装站点）。
 
 第一次用？按这个顺序走：
