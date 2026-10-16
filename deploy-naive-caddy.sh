@@ -3190,7 +3190,7 @@ self_test_subset_missing_errors() {
 # 行为级：子集必须「只跑命中的区段」——不多跑。这条是给「过滤静默失效」上的锁。
 # 报数行（命中 N / 共 M、另有 K 条被过滤）是 awk 单独扫出来的，跟实际执行无关：
 # 过滤整个坏掉时它照样印得漂漂亮亮。所以只能看行为——数真跑出来的区段标题：
-# 过滤在，跑「密码生成」只会印 [2] 一个区段；过滤没了（证伪实验①），19 个区段全印。
+# 过滤在，跑「密码生成」只会印 [2] 一个区段；过滤没了（证伪实验①），20 个区段全印。
 # 不用「PASS 条数 ≤ 报数」比：报数自身对 [2] 少算一条（既有实现的老毛病，本任务不动），
 # 拿它当基准会把一条正确的实现判红。
 self_test_subset_isolates_sections() {
@@ -3219,6 +3219,26 @@ self_test_subset_isolates_sections() {
 			"$nsec" "$total" >&2
 		printf '  实际跑到的区段：\n%s\n' \
 			"$(printf '%s' "$out" | grep -E '^\[[0-9]+\] ' | sed 's/^/    /')" >&2
+		return 1
+	fi
+	return 0
+}
+
+# 行为级：子集扫描器必须认得 `rc_case` 断言行。
+# 认不得的坏法不会报错 —— 子集模式会把以 rc_case 写的断言整条漏掉，
+# 报数行里「共 N 条」也跟着少算，看上去一切正常。所以拿真子进程验证：
+# 用一个只出现在 rc_case 断言名里的关键词去跑子集，必须命中 ≥1 条。
+# （命中 0 条时脚本自己会报「没有任何断言匹配」并非 0 退出 —— 正好被这里逮住。）
+rc_case_subset_scan_counts() {
+	_self_test_nested_skip && return 0
+	local out="" rc=0
+	out=$(AMIA_ST_NESTED=1 bash "$0" --self-test "rc_case 自证" 2>&1) || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf '  子集扫描器没认出 rc_case 断言行（退出 %s）。输出：\n%s\n' "$rc" "$out" >&2
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -q 'rc_case 自证'; then
+		printf '  子集没跑到 rc_case 自证断言。输出：\n%s\n' "$out" >&2
 		return 1
 	fi
 	return 0
@@ -3678,6 +3698,20 @@ self_test() {
 		fi
 	}
 
+	# 把「期望退出码 == N」变成一等断言。true_case 只断「为 0」、false_case 只断
+	# 「非 0」，都表达不了「恰好退 2」这种三档语义 —— 只能用不等号近似，而那正是
+	# 本项目最怕的「看起来精确」的假绿。参数：<名称> <期望码> <命令...>。
+	# 取值来源是子进程真实退出码（不是字符串匹配），与本文件其余行为级断言同源。
+	rc_case() {
+		local name="$1" want="$2" got=0; shift 2
+		"$@" >/dev/null 2>&1 || got=$?
+		if [ "$got" = "$want" ]; then
+			printf '  %sPASS%s %s\n' "$C_GRN" "$C_RST" "$name"; pass=$((pass + 1))
+		else
+			printf '  %sFAIL%s %s（期望退出码 %s，实得 %s）\n' "$C_RED" "$C_RST" "$name" "$want" "$got"; fail=$((fail + 1))
+		fi
+	}
+
 	# 用 <<< 而不是管道：大输入 + 匹配在开头时 grep 会提前退出，
 # 管道写法在 set -o pipefail 下会让「匹配成功」也返回 141（SIGPIPE）——
 # 表现为断言偶发假失败。herestring 没有上游进程，不存在这个问题。
@@ -3694,7 +3728,7 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 
 	tab_indent_ok() { printf '%s' "$1" | grep -q "^$(printf '\t')"; }
 # ---------------- 子集过滤（--self-test <模式>） ----------------
-	# 现有 385 条断言一行都没动，过滤是这么实现的：
+	# 既有的断言一条都没动（本轮新增 rc_case 前为 403 条，加后 410 条），过滤是这么实现的：
 	#   ① 区段级 —— 断言区以 `[N] 标题` 分段，整段不匹配就整段不执行，
 	#      连段内的准备代码（建临时目录 / 渲染配置 / 签证书）一起省掉；
 	#   ② 断言级 —— 段里不匹配的断言，交给辅助函数时直接不跑也不计数。
@@ -3737,7 +3771,7 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 					if (index(tolower($0), tolower(pat)) > 0) hit[nsec] = 1
 					next
 				}
-				if ($0 ~ /^[ \t]*(true|false|eq|skip)_case /) {
+				if ($0 ~ /^[ \t]*(true|false|eq|skip|rc)_case /) {
 					na++
 					aln[na] = NR
 					asec[na] = nsec
@@ -3773,10 +3807,10 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 		fi
 		printf '子集自检：模式「%s」，命中 %s / 共 %s 条断言\n' \
 			"${SELF_TEST_PATTERN}" "$st_kept" "$st_total"
-		# 断言级过滤：把四个辅助函数换成「先问该不该跑、再转交原实现」的包装器。
+		# 断言级过滤：把五个辅助函数换成「先问该不该跑、再转交原实现」的包装器。
 		# 原实现用 declare -f 拷出来（不是重写的），语义与原来逐字一致。
 		local st_fn="" st_def=""
-		for st_fn in true_case false_case eq_case skip_case; do
+		for st_fn in true_case false_case eq_case skip_case rc_case; do
 			st_def=$(declare -f "$st_fn")
 			eval "_st_orig_${st_fn}${st_def#"${st_fn}"}"
 		done
@@ -3791,6 +3825,9 @@ not_has() { if grep -qE "$2" <<< "$1"; then return 1; fi; return 0; }
 		}
 		skip_case() {
 			if st_match "${BASH_LINENO[0]}"; then _st_orig_skip_case "$@"; fi
+		}
+		rc_case() {
+			if st_match "${BASH_LINENO[0]}"; then _st_orig_rc_case "$@"; fi
 		}
 	fi
 
@@ -4566,7 +4603,7 @@ SSLCNF
 
 	fi
 	# ---- 19) 子集自检自身的收尾（SC2295 / 区域索引 / 过滤行为）----
-	# 这一节单独成节，不混进上面任何既有区段：既有 385 条一行没动，这里纯新增。
+	# 这一节单独成节，不混进上面任何既有区段：既有断言一条没动，[19d] 的 rc_case 相关为纯新增。
 	if st_want 19; then
 	printf '\n[19] 子集自检收尾（SC2295 / 区域索引 / 过滤行为）\n'
 
@@ -4593,6 +4630,23 @@ SSLCNF
 	# 过滤「静默失效」（最危险的一种坏法）：报数行照旧漂亮，实际却跑满全量。
 	# 只数真跑出来的 PASS，不看报数行，才逮得住。
 	true_case "子集只跑命中的断言、不多跑" self_test_subset_isolates_sections
+
+	# ---- 19d) rc_case 自证（新增辅助自身可用 + 不会被过滤静默漏掉）----
+	# 最危险的坏法不是「rc_case 算错」，而是「它被漏在过滤之外」：
+	# 那不会报任何错，只是 --self-test <模式> 少跑几条 —— 静默漏测。
+	# 所以既要证明它能用（真调一次、精确比对非 0 退出码），也要证明
+	# 扫描器认得带 rc_case 的行（认不得时子集会「零命中即报错」，正好被逮住）。
+	rc_case "rc_case 自证：读到真实退出码 3（非 0 也精确比对）" 3 bash -c 'exit 3'
+	# 断言行自己不许含被搜的字面量（否则断的是这一行、不是那段代码）—— 与 [8] 同法：用变量拼。
+	local st_fpat="for st_fn in true_case false_case eq_case skip_case rc"
+	st_fpat="${st_fpat}_case"
+	true_case "rc_case 已加进过滤包装器列表（漏了就静默漏测）" \
+		has "$(fn_code self_test)" "$st_fpat"
+	local st_opat="_st_orig_rc"
+	st_opat="${st_opat}_case"
+	true_case "rc_case 的过滤包装器已定义并转交原实现" \
+		has "$(fn_code self_test)" "$st_opat"
+	true_case "扫描器认得 rc_case 断言行（子集不会漏测）" rc_case_subset_scan_counts
 
 	fi
 	# ---- 20) 退出码 2：部署完成但验证未确认（v2.6.0 新增）----
