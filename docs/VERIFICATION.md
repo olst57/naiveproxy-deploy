@@ -105,11 +105,22 @@ Alpine / openrc 路径、arm64 的 `--build-from-source`、以及失败注入矩
 ### 未覆盖（重要，别当成已验证）
 
 - **Alpine + openrc 路径**（含 busybox `sed`/`ss` 缺失场景）
-  —— CI 作业 `.github/workflows/alpine-openrc.yml` 已就位（真 `alpine:3.20` 容器），
-  **但截至本次提交尚未跑过**。在该作业出结果之前，这一行**仍算未验证**，
-  不要因为「CI 文件存在」就当成已验证。
-- **arm64 的 `--build-from-source`**（上游无 arm64 资产，推理为大概率失败）
-- **失败注入矩阵**（故意占端口、故意破坏状态文件、伪造域名不解析、打断下载）
+  —— 已在真 `alpine:3.20` 容器里跑过（`.github/workflows/alpine-openrc.yml`）：
+  **392 通过 / 0 失败 / 1 跳过**，唯一跳过是「非 root 拦截」（容器默认 root，环境固有，非脚本问题）。
+  openrc 渲染产物另经 `sh -n`（busybox）与 `reload()` 存在性核对，均通过。
+- **arm64 的 `--build-from-source`** —— **已实测通过**（`.github/workflows/arm64.yml`，真 `ubuntu-24.04-arm`）：
+  Go 1.27.2 源码构建 **47 秒**（rc=0），产出 `ELF 64-bit LSB executable, ARM aarch64`；
+  `list-modules` 里 `http.handlers.forward_proxy` **确切名字已核对**；
+  含 `forward_proxy` 的最小 Caddyfile 经 `caddy validate` 通过。
+- **失败注入矩阵**（`.github/workflows/failure-injection.yml`，7 阶段逐个注入）
+  —— **已跑，但结论部分不可信**：阶段 1-6 注入后退出码均为 1、均有错误行、撤销后均可恢复；
+  **阶段 7 的注入本身失效**（harness 装完注入只打「注入完成」就从不对注入是否生效做校验），
+  故该行读数 0 反映的是「注入没打中」而非「脚本不报错」—— 待修（见下）。
+- ★ **阶段 7 的已知缺陷（v2.6.0 已部分修复）**：`verify_deployment()` 里除「服务 is-active」外的
+  4 项（本机 HTTPS 握手 / 证书信息 / 代理转发实测 / 公网可达）只走 `verify_warn()` 累加计数器，
+  **失败时退出码曾为 0**。v2.6.0 引入退出码 **2**＝「部署完成但验证未确认」。
+  另发现该阶段唯一的 `return 1` 被 `if [ "$INIT" = "systemd" ]` 包住，
+  故 **openrc / `INIT` 为空的机器上阶段 7 曾完全没有失败路径**。
 - `forward_proxy` 子指令在真机上的**运行行为**（`hide_ip` 是否真摘掉 `Forwarded`、`ports` 白名单是否真拦端口）
   未经实测，只做过语法核对 —— 这部分依据上游 fork 官方文档编写
 

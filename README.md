@@ -382,8 +382,13 @@ sudo ./deploy-naive-caddy.sh --collect-diagnostics  # 出问题时收集信息
 - **Windows 上校验配置的坑**（`/var/...` 解析、GBK 输出） → [`docs/windows-validation.md`](docs/windows-validation.md)
 - **各版本修了什么** → [`CHANGELOG.md`](CHANGELOG.md)
 
-> 一句话概括验证状态：主路径已在真机（Debian 13）端到端跑通并留证；
-> Alpine/openrc、arm64 源码编译、失败注入矩阵**尚未覆盖**。详见 `docs/VERIFICATION.md`。
+> 一句话概括验证状态：主路径已在真机（Debian 13）端到端跑通并留证；**Alpine/openrc 与 arm64
+> 源码编译已在 CI 真机跑通并留读数**；失败注入矩阵已跑，但其中阶段 7 的注入自身失效、结论待修。
+> 详见 `docs/VERIFICATION.md`。
 >
-> Alpine/openrc 已有 CI 作业（`.github/workflows/alpine-openrc.yml`，真 `alpine:3.20` 容器），
-> 但**跑出结果之前不算验证** —— CI 文件存在 ≠ 已验证。
+> - **Alpine/openrc**（`.github/workflows/alpine-openrc.yml`，真 `alpine:3.20` 容器）：
+>   **392 通过 / 0 失败 / 1 跳过**（跳过项为「非 root 拦截」，容器默认 root 所致）。
+> - **arm64 源码构建**（`.github/workflows/arm64.yml`，真 `ubuntu-24.04-arm`）：
+>   Go 1.27.2 构建 **47 秒**，产出 arm64 ELF；`http.handlers.forward_proxy` 确切模块名已核对。
+> - **失败注入矩阵**（`.github/workflows/failure-injection.yml`）：阶段 1-6 退出码均为 1、可恢复；
+>   阶段 7 的注入本身失效，该行读数不可信 —— 正在修 harness。
